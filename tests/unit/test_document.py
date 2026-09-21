@@ -9,7 +9,8 @@ from crdt_coedit_agents.crdt.hlc import Timestamp
 from crdt_coedit_agents.crdt.ids import Dot
 from crdt_coedit_agents.crdt.lww import LWWEntry
 from crdt_coedit_agents.crdt.orset import Tag
-from tests.conftest import make_replica
+from crdt_coedit_agents.ops.model import TextInsert, UnsignedOp
+from tests.conftest import make_replica, seeded_identity
 
 pytestmark = pytest.mark.unit
 
@@ -162,3 +163,38 @@ def test_states_of_different_documents_cannot_be_joined() -> None:
 def test_size_bytes_counts_text_fields_and_tags() -> None:
     state = build()
     assert state.size_bytes() == len("hello") + len('"Notes"') + len("draft")
+
+
+def test_a_suggestion_cannot_anchor_itself_inside_another_suggestion() -> None:
+    """The probe a malicious peer would run: ``parent`` comes off the wire, so it is checked.
+
+    Anchoring suggestion OTHER inside the still-undecided SUGGESTION is impossible through
+    ``editing_scope``, but trivial by hand. Rejecting SUGGESTION and accepting OTHER must still
+    leave the main view exactly as it would be had neither suggestion existed.
+    """
+    owner = make_replica(1)
+    owner.insert_text("HELLO")
+    agent = make_replica(2, start_ms=1_700_000_010_000)
+    agent.receive(list(owner.ops()))
+    inside = agent.insert_text("X", after=agent.view().anchors[-1], suggestion_id=SUGGESTION)
+
+    identity = seeded_identity(2)
+    forged_anchor = identity.sign(
+        UnsignedOp(
+            doc_id=owner.doc_id,
+            replica_id=identity.replica_id,
+            seq=inside[-1].op.seq + 1,
+            ts=Timestamp(1_700_000_010_050, 0, identity.replica_id).encode(),
+            suggestion_id=OTHER,
+            payload=TextInsert(parent=str(inside[-1].dot), side="R", value="Y"),
+        )
+    )
+
+    owner.receive([*inside, forged_anchor])
+    owner.decide(SUGGESTION, accept=False)
+    owner.decide(OTHER, accept=True)
+
+    assert owner.view().text == "HELLO"
+    counterfactual = make_replica(3, start_ms=1_700_000_020_000)
+    counterfactual.receive(list(owner.ops()))
+    assert counterfactual.view().text == "HELLO"

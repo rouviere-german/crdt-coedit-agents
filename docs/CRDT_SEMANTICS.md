@@ -146,8 +146,18 @@ Two scopes matter:
 
 Position resolution happens *inside the editing scope*. A main edit therefore never becomes a child
 of a suggested node, so the set of main nodes is closed under "parent" and the relative order of
-main nodes does not depend on any suggestion. That is what makes the two guarantees below exact
-rather than approximate.
+main nodes does not depend on any suggestion.
+
+That closure is **enforced, not assumed**. `parent` travels on the wire, so a replica that ignores
+`insert_position` can name any node at all — a suggestion anchored inside a different, undecided
+suggestion, or a main-scope element anchored inside one. Materialization therefore emits a node
+only when the node *and every one of its ancestors* are in the view, which makes such an element
+invisible everywhere its anchor is not
+(`tests/unit/test_fugue.py::test_a_suggestion_anchored_to_another_suggestion_is_invisible_without_it`,
+`tests/unit/test_document.py::test_a_suggestion_cannot_anchor_itself_inside_another_suggestion`).
+The ancestor walk is memoized across a traversal and skipped entirely while no node carries a
+suggestion id, so materializing a document without suggestions costs exactly what it did before.
+That is what makes the two guarantees below exact rather than approximate.
 
 **Rejecting leaves no trace.** After a suggestion is rejected, the main view is byte-identical to
 replaying the same history with that suggestion's operations removed altogether. Checked by
@@ -164,9 +174,11 @@ rebased and nothing is re-signed. Decisions are themselves last-writer-wins, so 
 rejecting converges on the later decision.
 
 **One caveat, stated plainly.** Once a suggestion is accepted, later edits may anchor *inside* it,
-because it is part of the main view. Rejecting it afterwards hides its own elements but leaves
-those later edits where they are. Acceptance is meant to be a one-way step; re-rejecting an
-accepted suggestion is supported but is not the case the guarantees above are about.
+because it is part of the main view. Rejecting it afterwards hides its own elements and, by
+parent-closure, everything anchored inside them — the later edits disappear with it rather than
+being re-parented, because there is no position left to re-parent them to. Acceptance is meant to
+be a one-way step; re-rejecting an accepted suggestion is supported, converges, and is deterministic,
+but it is not the case the guarantees above are about.
 
 ## Deletion
 

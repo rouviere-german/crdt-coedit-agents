@@ -44,9 +44,16 @@ Every node and every tombstone carries a ``suggestion_id`` (``None`` for the mai
 * **Position resolution** happens inside the scope the edit is made in (main, or main plus one
   suggestion). A main edit therefore never becomes a child of a suggested node, so the set of main
   nodes is closed under "parent" and their relative order does not depend on any suggestion.
-* **Materialization** walks the whole tree and emits only the nodes a view accepts. Because scopes
-  are parent-closed, filtering the full traversal is the same as traversing the filtered tree, so
-  rejecting a suggestion leaves the main view byte-identical to a run that never contained it.
+* **Materialization** walks the whole tree and emits a node only when the node *and every one of
+  its ancestors* are in the view. That closure is enforced here rather than assumed, because
+  ``parent`` arrives on the wire: a replica that ignores :meth:`insert_position` can anchor a
+  suggestion to another, undecided suggestion's node, or anchor a main-scope element inside a
+  suggestion. Walking the ancestors makes such an element invisible in every view that does not
+  also contain its anchor, which is what makes rejecting a suggestion leave the main view
+  byte-identical to a run that never contained it.
+
+  The walk is skipped entirely while no node carries a suggestion id, so a document with no
+  suggestions materializes exactly as before.
 """
 
 from __future__ import annotations
@@ -114,7 +121,7 @@ def sibling_key(dot: Dot) -> tuple[int, str]:
 class FugueTree:
     """A Fugue sequence. The join is the union of the node set and of the tombstone map."""
 
-    __slots__ = ("_children", "_nodes", "_order", "_tombstones")
+    __slots__ = ("_children", "_nodes", "_order", "_scoped", "_tombstones")
 
     def __init__(
         self,
@@ -127,6 +134,9 @@ class FugueTree:
         # sibling_key. Left children are traversed in reverse.
         self._children: dict[Dot | None, tuple[list[Dot], list[Dot]]] = {}
         self._order: list[Dot] | None = None
+        # Dots of the nodes that carry a suggestion id. While this is empty every node is in the
+        # main scope, so parent-closure holds for free and materializing can skip the ancestor walk.
+        self._scoped: set[Dot] = set()
         for node in (nodes or {}).values():
             self._attach(node)
 
@@ -174,6 +184,7 @@ class FugueTree:
             parent: (list(left), list(right)) for parent, (left, right) in self._children.items()
         }
         clone._order = list(self._order) if self._order is not None else None
+        clone._scoped = set(self._scoped)
         return clone
 
     # ------------------------------------------------------------ mutations
@@ -188,6 +199,8 @@ class FugueTree:
                 )
             return False
         self._nodes[node.dot] = node
+        if node.suggestion_id is not None:
+            self._scoped.add(node.dot)
         left, right = self._children.setdefault(node.parent, ([], []))
         bisect.insort(right if node.side is Side.RIGHT else left, node.dot, key=sibling_key)
         self._order = None
@@ -220,7 +233,36 @@ class FugueTree:
         return self._children.get(parent, ([], []))
 
     def _in_scope(self, dot: Dot, scope: ScopeFilter) -> bool:
-        return scope(self._nodes[dot].suggestion_id)
+        """True when ``dot`` and every one of its ancestors are inside ``scope``."""
+        if not self._scoped:
+            return scope(self._nodes[dot].suggestion_id)
+        return self._scope_ok(dot, scope)
+
+    def _scope_ok(self, dot: Dot, scope: ScopeFilter, memo: dict[Dot, bool] | None = None) -> bool:
+        """Parent-closed scope test, iterative so a 100 000-node chain cannot blow the stack.
+
+        ``memo`` carries results across a whole traversal, which keeps materializing linear: each
+        node's ancestors are walked at most once.
+        """
+        chain: list[Dot] = []
+        current: Dot | None = dot
+        result = True
+        while current is not None:
+            if memo is not None and current in memo:
+                result = memo[current]
+                break
+            node = self._nodes.get(current)
+            if node is None or not scope(node.suggestion_id):
+                if memo is not None and node is not None:
+                    memo[current] = False
+                result = False
+                break
+            chain.append(current)
+            current = node.parent
+        if memo is not None:
+            for item in chain:
+                memo[item] = result
+        return result
 
     def insert_position(
         self, after: Dot | None, scope: ScopeFilter = _main_only
@@ -294,14 +336,27 @@ class FugueTree:
         return order
 
     def is_visible(self, dot: Dot, view: ScopeFilter) -> bool:
-        node = self._nodes[dot]
-        if not view(node.suggestion_id):
+        if not self._in_scope(dot, view):
             return False
-        return not any(view(scope) for scope in self._tombstones.get(dot, ()))
+        return not self._is_deleted(dot, view)
+
+    def _is_deleted(self, dot: Dot, view: ScopeFilter) -> bool:
+        return any(view(scope) for scope in self._tombstones.get(dot, ()))
 
     def visible_nodes(self, view: ScopeFilter = _main_only) -> list[FugueNode]:
         """Nodes of the view in list order."""
-        return [self._nodes[dot] for dot in self.traversal() if self.is_visible(dot, view)]
+        if not self._scoped:
+            return [
+                self._nodes[dot]
+                for dot in self.traversal()
+                if view(self._nodes[dot].suggestion_id) and not self._is_deleted(dot, view)
+            ]
+        memo: dict[Dot, bool] = {}
+        return [
+            self._nodes[dot]
+            for dot in self.traversal()
+            if self._scope_ok(dot, view, memo) and not self._is_deleted(dot, view)
+        ]
 
     def materialize(self, view: ScopeFilter = _main_only) -> str:
         """The text of the view."""

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from crdt_coedit_agents.crdt.fugue import (
@@ -19,6 +21,7 @@ pytestmark = pytest.mark.unit
 A = "a" * 32
 B = "b" * 32
 SUGGESTION = "sg-" + "1" * 16
+OTHER = "sg-" + "2" * 16
 
 
 def dot(seq: int, replica_id: str = A) -> Dot:
@@ -206,3 +209,63 @@ def test_from_items_rebuilds_an_identical_tree() -> None:
     rebuilt = FugueTree.from_items(tree.nodes(), tree.tombstones())
     assert rebuilt == tree
     assert rebuilt.traversal() == tree.traversal()
+
+
+def accepting(*suggestions: str) -> Callable[[str | None], bool]:
+    """A view that shows the main document plus the named suggestions."""
+    allowed = frozenset(suggestions)
+
+    def view(scope: str | None) -> bool:
+        return scope is None or scope in allowed
+
+    return view
+
+
+def test_a_suggestion_anchored_to_another_suggestion_is_invisible_without_it() -> None:
+    """Scopes are parent-closed. ``parent`` arrives on the wire, so it is checked, not trusted."""
+    tree = FugueTree()
+    base = type_text(tree, "HELLO")
+    first = tree.insert_after(
+        dot(10, B), "X", after=base[-1], suggestion_id=SUGGESTION, scope=main_only
+    )
+    # Hand-built: editing_scope(OTHER) would never resolve a parent inside an undecided SUGGESTION.
+    tree.add_node(
+        FugueNode(dot=dot(11, B), parent=first.dot, side=Side.RIGHT, value="Y", suggestion_id=OTHER)
+    )
+
+    assert tree.materialize(main_only) == "HELLO"
+    # Accepting only the second suggestion must not smuggle in text anchored inside the first.
+    assert tree.materialize(accepting(OTHER)) == "HELLO"
+    assert tree.materialize(accepting(SUGGESTION)) == "HELLOX"
+    # Accepting both is the legitimate case, and it still works.
+    assert tree.materialize(accepting(SUGGESTION, OTHER)) == "HELLOXY"
+
+
+def test_a_main_element_anchored_inside_a_suggestion_is_invisible_in_the_main_view() -> None:
+    tree = FugueTree()
+    base = type_text(tree, "AB")
+    suggested = tree.insert_after(
+        dot(10, B), "Z", after=base[-1], suggestion_id=SUGGESTION, scope=main_only
+    )
+    tree.add_node(
+        FugueNode(
+            dot=dot(11, B), parent=suggested.dot, side=Side.RIGHT, value="Q", suggestion_id=None
+        )
+    )
+
+    assert tree.materialize(main_only) == "AB"
+    assert tree.anchors(main_only) == [str(base[0]), str(base[1])]
+    assert tree.materialize(accepting(SUGGESTION)) == "ABZQ"
+
+
+def test_parent_closure_survives_a_deep_chain_inside_a_suggestion() -> None:
+    """The ancestor walk is iterative and memoized, so depth and cost both stay bounded."""
+    tree = FugueTree()
+    cursor: Dot | None = None
+    for seq in range(1, 2_001):
+        cursor = tree.insert_after(
+            dot(seq, B), "x", after=cursor, suggestion_id=SUGGESTION, scope=accepting(SUGGESTION)
+        ).dot
+
+    assert tree.materialize(main_only) == ""
+    assert len(tree.materialize(accepting(SUGGESTION))) == 2_000
