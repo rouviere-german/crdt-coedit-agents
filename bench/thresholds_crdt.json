@@ -1,0 +1,9 @@
+{
+  "local_insert": {"p95_us": 600},
+  "remote_apply_verified": {"p95_us": 700},
+  "merge_only": {"p95_us": 60},
+  "materialize_20000": {"p95_us": 200000},
+  "state_memory_100k": {"peak_kib": 120000, "bytes_per_element": 1200},
+  "delta_vs_full_state": {"delta_fraction_behind_10": 0.02, "delta_fraction_behind_100": 0.1},
+  "convergence_5_replicas": {"p95_us": 250000, "distinct_state_hashes": 1, "distinct_views": 1}
+}
