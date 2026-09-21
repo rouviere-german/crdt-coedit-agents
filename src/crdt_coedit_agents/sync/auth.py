@@ -33,7 +33,7 @@ from typing import Any
 import jwt
 from pydantic import SecretStr
 
-from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN
+from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN, is_replica_id
 from crdt_coedit_agents.ops.model import SUGGESTABLE_KINDS, SignedOp
 
 __all__ = [
@@ -136,7 +136,7 @@ def verify_token(secret: SecretStr, token: str, *, doc_id: str) -> Grant:
     raw_role = claims.get("role")
     if not isinstance(principal, str) or not isinstance(document, str):
         raise TokenError("token is missing the subject or the document claim")
-    if not isinstance(replica_id, str) or len(replica_id) != 32:
+    if not isinstance(replica_id, str) or not is_replica_id(replica_id):
         raise TokenError(f"token replica id must match {REPLICA_ID_PATTERN}")
     if document != doc_id:
         raise TokenError("token was issued for a different document")

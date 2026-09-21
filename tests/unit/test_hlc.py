@@ -108,6 +108,11 @@ def test_malformed_timestamps_are_rejected() -> None:
         Timestamp(0, MAX_COUNTER + 1, REPLICA_A)
     with pytest.raises(ValueError, match="replica id"):
         Timestamp(0, 0, "short")
+    # Right length, wrong alphabet: the error message names a regex, so apply it.
+    with pytest.raises(ValueError, match="replica id"):
+        Timestamp(0, 0, "Z" * 32)
+    with pytest.raises(ValueError, match="replica id"):
+        Timestamp(0, 0, "A" * 32)
 
 
 def test_a_real_identity_produces_a_usable_replica_id() -> None:

@@ -139,6 +139,9 @@ def test_tokens_missing_or_misusing_claims_are_refused() -> None:
         verify_token(SECRET, forge(doc=7), doc_id=DOC)
     with pytest.raises(TokenError, match="replica id"):
         verify_token(SECRET, forge(rid="short"), doc_id=DOC)
+    # Right length, wrong alphabet: the error message names a regex, so apply it.
+    with pytest.raises(TokenError, match="replica id"):
+        verify_token(SECRET, forge(rid="Z" * 32), doc_id=DOC)
     with pytest.raises(TokenError, match="missing the role"):
         verify_token(SECRET, forge(role=None), doc_id=DOC)
     with pytest.raises(TokenError, match="unknown role"):

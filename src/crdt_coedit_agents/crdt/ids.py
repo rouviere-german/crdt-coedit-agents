@@ -20,6 +20,7 @@ __all__ = [
     "Dot",
     "VersionVector",
     "format_dot",
+    "is_replica_id",
     "parse_dot",
 ]
 
@@ -27,6 +28,11 @@ __all__ = [
 REPLICA_ID_PATTERN = r"^[0-9a-f]{32}$"
 _REPLICA_ID = re.compile(REPLICA_ID_PATTERN)
 _DOT = re.compile(r"^([0-9a-f]{32})\.([1-9][0-9]{0,17})$")
+
+
+def is_replica_id(text: str) -> bool:
+    """True when ``text`` really is a replica id, i.e. 32 lower-case hex characters."""
+    return _REPLICA_ID.fullmatch(text) is not None
 
 
 @dataclass(frozen=True, slots=True, order=True)

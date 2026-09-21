@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN
+from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN, is_replica_id
 
 __all__ = [
     "MAX_COUNTER",
@@ -51,7 +51,7 @@ class Timestamp:
             raise ValueError("wall_ms must be non-negative")
         if not 0 <= self.counter <= MAX_COUNTER:
             raise ValueError(f"counter must be within 0..{MAX_COUNTER}")
-        if len(self.replica_id) != 32:
+        if not is_replica_id(self.replica_id):
             raise ValueError(f"replica id must match {REPLICA_ID_PATTERN}")
 
     def encode(self) -> str:
