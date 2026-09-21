@@ -117,7 +117,7 @@ def test_the_suggestion_digest_covers_only_that_suggestion() -> None:
 
 def test_the_state_hash_ignores_arrival_order_but_not_content() -> None:
     first = make_replica(1)
-    second = make_replica(2, start_ms=1_700_000_500_000)
+    second = make_replica(2, start_ms=1_700_000_010_000)
     first.insert_text("abc")
     second.insert_text("xyz")
     left, right = first.state.join(second.state), second.state.join(first.state)

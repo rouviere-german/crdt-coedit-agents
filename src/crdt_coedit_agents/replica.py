@@ -18,9 +18,10 @@ from dataclasses import dataclass
 
 from pydantic import JsonValue
 
+from crdt_coedit_agents.core.logging import get_logger
 from crdt_coedit_agents.crdt.document import DocumentState, DocumentView
 from crdt_coedit_agents.crdt.fugue import UnknownAnchorError
-from crdt_coedit_agents.crdt.hlc import HybridLogicalClock, Timestamp
+from crdt_coedit_agents.crdt.hlc import ClockDriftError, HybridLogicalClock, Timestamp
 from crdt_coedit_agents.crdt.ids import Dot, VersionVector, parse_dot
 from crdt_coedit_agents.ops.apply import OpRejectedError, apply_op
 from crdt_coedit_agents.ops.model import (
@@ -40,6 +41,8 @@ from crdt_coedit_agents.ops.signing import ReplicaIdentity, verify_op
 
 __all__ = ["ReplayError", "Replica", "SyncReport", "new_suggestion_id"]
 
+_log = get_logger("crdt_coedit_agents.replica")
+
 
 class ReplayError(ValueError):
     """A ``(replica_id, seq)`` pair was reused for a different operation."""
@@ -47,11 +50,17 @@ class ReplayError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SyncReport:
-    """What a batch of incoming operations did."""
+    """What a batch of incoming operations did.
+
+    ``rejected`` counts operations that verified but were refused by a bound the replica enforces
+    on arrival — today only the clock-drift bound. They are not stored, so the sender can resend
+    them once its clock is back inside the window.
+    """
 
     received: int
     applied: int
     duplicates: int
+    rejected: int = 0
 
 
 def new_suggestion_id(rng: secrets.SystemRandom | None = None) -> str:
@@ -236,8 +245,13 @@ class Replica:
         return dot in self._ops
 
     def receive(self, ops: Iterable[SignedOp]) -> SyncReport:
-        """Verify, replay-check and apply incoming operations. Order does not matter."""
-        received = applied = duplicates = 0
+        """Verify, clock-bound, replay-check and apply incoming operations.
+
+        Order does not matter. An operation whose timestamp is more than
+        :data:`~crdt_coedit_agents.crdt.hlc.MAX_DRIFT_MS` ahead of this replica's wall clock is
+        counted in ``rejected`` and neither stored nor applied.
+        """
+        received = applied = duplicates = rejected = 0
         for signed in ops:
             received += 1
             if signed.op.doc_id != self._doc_id:
@@ -253,10 +267,31 @@ class Replica:
                 duplicates += 1
                 continue
             verify_op(signed)
+            # Merge the sender's clock reading. This is what makes the clock *hybrid logical*
+            # rather than merely physical: the next local timestamp is greater than anything this
+            # replica has received, so a write that causally follows a remote one also sorts after
+            # it. It is also where the drift bound is enforced, which stops a replica from pinning
+            # every last-writer-wins register with a timestamp far in the future.
+            try:
+                self._clock.observe(signed.op.timestamp)
+            except ClockDriftError as exc:
+                rejected += 1
+                _log.warning(
+                    "op_rejected",
+                    doc_id=self._doc_id,
+                    author=signed.op.replica_id,
+                    author_seq=signed.op.seq,
+                    kind=signed.op.kind,
+                    reason="clock_drift",
+                    detail=str(exc),
+                )
+                continue
             self._store(signed)
             if apply_op(self._state, signed):
                 applied += 1
-        return SyncReport(received=received, applied=applied, duplicates=duplicates)
+        return SyncReport(
+            received=received, applied=applied, duplicates=duplicates, rejected=rejected
+        )
 
     def receive_delta(self, delta: Delta) -> SyncReport:
         if delta.doc_id != self._doc_id:

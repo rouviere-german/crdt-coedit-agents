@@ -96,7 +96,7 @@ def test_a_serialized_trace_relayed_through_a_second_replica_still_matches(
 ) -> None:
     """Editing alternates between two replicas, each fully synchronized before it writes."""
     first = make_replica(1)
-    second = make_replica(2, start_ms=1_700_000_500_000)
+    second = make_replica(2, start_ms=1_700_000_010_000)
     oracle = Oracle()
 
     for turn, (is_insert, position, value) in enumerate(edits):
@@ -144,7 +144,7 @@ def test_the_oracle_and_the_replica_agree_on_a_hand_written_trace() -> None:
 def test_concurrent_edits_are_documented_as_outside_the_differential_scope() -> None:
     """Both converge; they need not agree with each other, so only convergence is asserted."""
     first = make_replica(1)
-    second = make_replica(2, start_ms=1_700_000_500_000)
+    second = make_replica(2, start_ms=1_700_000_010_000)
     first.insert_text("shared")
     second.receive(list(first.ops()))
 

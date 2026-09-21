@@ -44,9 +44,22 @@ Hybrid logical clocks (Kulkarni et al., *Logical Physical Clocks*, OPODIS 2014).
 before *b*, then `ts(a) < ts(b)` — while staying close to wall-clock time, which matters because
 the LWW registers resolve conflicts by timestamp.
 
+Every verified remote timestamp is merged into the receiving replica's clock
+(`Replica.receive` -> `HybridLogicalClock.observe`), which is what makes the clock *hybrid
+logical* and not merely physical: the next local timestamp is strictly greater than anything the
+replica has received, so a write that causally follows a remote one also sorts after it
+(`tests/unit/test_replica.py::test_receiving_a_remote_timestamp_pulls_the_local_clock_past_it`).
+
 A remote timestamp more than 60 seconds ahead of local wall time is **refused** rather than
-adopted. Without that bound, one replica could set its clock to the year 3000 and win every field
-write forever (`tests/unit/test_hlc.py::test_a_remote_clock_too_far_ahead_is_refused`).
+adopted, on both paths that admit operations: a peer counts it in `SyncReport.rejected` and never
+stores it, and the sync server refuses it with the rejection reason `clock_drift` before it reaches
+the log. Without that bound, one replica could set its clock to the year 3000 and win every field
+write — including a suggestion's accept flag — forever
+(`tests/unit/test_hlc.py::test_a_remote_clock_too_far_ahead_is_refused`,
+`tests/unit/test_replica.py::test_an_operation_dated_far_in_the_future_is_refused_on_receive`,
+`tests/integration/test_hub.py::test_an_operation_dated_far_in_the_future_never_reaches_the_log`).
+The cost is that a peer whose clock genuinely runs more than 60 seconds fast has its operations
+dropped instead of buffered; it has to resend them once its clock is corrected.
 
 ## The sequence: Fugue
 

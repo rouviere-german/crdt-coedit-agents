@@ -147,7 +147,7 @@ def test_catch_up_sends_exactly_what_a_version_vector_is_missing() -> None:
     owner = make_replica(1)
     document_hub.submit(grant(owner, Role.OWNER), owner.insert_text("abcde"))
 
-    newcomer = make_replica(2, start_ms=1_700_000_500_000)
+    newcomer = make_replica(2, start_ms=1_700_000_010_000)
     missing = document_hub.catch_up(DOC, newcomer.version_vector)
     assert len(missing) == 5
     newcomer.receive(missing)
@@ -165,7 +165,7 @@ def test_catch_up_is_bounded() -> None:
 def test_accepted_operations_are_relayed_to_other_subscribers_only() -> None:
     async def scenario() -> tuple[int, int]:
         document_hub, _ = hub()
-        owner, watcher = make_replica(1), make_replica(2, start_ms=1_700_000_500_000)
+        owner, watcher = make_replica(1), make_replica(2, start_ms=1_700_000_010_000)
         author_feed = document_hub.subscribe(DOC, owner.replica_id)
         watcher_feed = document_hub.subscribe(DOC, watcher.replica_id)
         assert document_hub.subscriber_count(DOC) == 2
@@ -185,7 +185,7 @@ def test_accepted_operations_are_relayed_to_other_subscribers_only() -> None:
 def test_a_subscriber_that_stops_reading_is_marked_for_disconnection() -> None:
     async def scenario() -> tuple[bool, int]:
         document_hub, _ = hub(subscriber_queue=1, max_ops_per_push=64)
-        owner, slow = make_replica(1), make_replica(2, start_ms=1_700_000_500_000)
+        owner, slow = make_replica(1), make_replica(2, start_ms=1_700_000_010_000)
         feed = document_hub.subscribe(DOC, slow.replica_id)
         for _ in range(3):
             document_hub.submit(grant(owner, Role.OWNER), owner.append_text("x"))
@@ -212,7 +212,7 @@ def test_the_hub_rebuilds_its_state_from_the_log_and_audits_decisions(tmp_path: 
     first = DocumentHub(log, audit=audit)
 
     owner = make_replica(1)
-    agent = make_replica(2, start_ms=1_700_000_500_000)
+    agent = make_replica(2, start_ms=1_700_000_010_000)
     first.submit(grant(owner, Role.OWNER), owner.insert_text("hello"))
     agent.receive(first.catch_up(DOC, agent.version_vector))
     suggestion_id = new_suggestion_id()
@@ -241,3 +241,35 @@ def test_operations_for_another_document_never_pass_authorization() -> None:
     ops: list[SignedOp] = owner.insert_text("a")
     result = document_hub.submit(grant(owner, Role.OWNER), ops)
     assert result.rejected == {"authorization": 1}
+
+
+def test_an_operation_dated_far_in_the_future_never_reaches_the_log(tmp_path: Path) -> None:
+    """A last-writer-wins register is only as safe as the clock bound behind it."""
+    document_hub, audit = hub(tmp_path)
+    editor = make_replica(1)
+    identity = seeded_identity(1)
+    evil = identity.sign(
+        UnsignedOp(
+            doc_id=DOC,
+            replica_id=identity.replica_id,
+            seq=1,
+            ts=Timestamp(999_999_999_999_999, 0, identity.replica_id).encode(),
+            payload=FieldSet(key="status", value="locked-forever"),
+        )
+    )
+
+    result = document_hub.submit(grant(editor, Role.EDITOR), [evil])
+
+    assert result.rejected == {"clock_drift": 1}
+    assert result.accepted == 0
+    assert document_hub.op_log.count(DOC) == 0
+    assert document_hub.state(DOC).view().fields == {}
+    assert audit is not None
+    assert any(
+        json.loads(line)["data"].get("reason") == "clock_drift"
+        for line in audit.path.read_text(encoding="utf-8").splitlines()
+    )
+
+    honest = document_hub.submit(grant(editor, Role.EDITOR), [editor.set_field("status", "open")])
+    assert honest.ok
+    assert document_hub.state(DOC).view().fields == {"status": "open"}

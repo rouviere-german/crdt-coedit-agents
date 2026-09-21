@@ -53,7 +53,7 @@ def _is_contiguous(positions: list[int]) -> bool:
 
 def _setup(base: str, position: int) -> tuple[Replica, Replica, str | None]:
     left = make_replica(1)
-    right = make_replica(2, start_ms=1_700_000_500_000)
+    right = make_replica(2, start_ms=1_700_000_010_000)
     left.insert_text(base)
     right.receive(list(left.ops()))
     anchors = left.view().anchors
@@ -111,7 +111,7 @@ def test_three_concurrent_runs_stay_in_three_blocks(
     base: str, position: int, first: int, second: int, third: int
 ) -> None:
     left, right, anchor = _setup(base, position)
-    other = make_replica(3, start_ms=1_700_001_000_000)
+    other = make_replica(3, start_ms=1_700_000_020_000)
     other.receive(list(left.ops()))
 
     runs = [

@@ -50,7 +50,7 @@ def test_a_snapshot_restores_into_a_working_replica(tmp_path: Path) -> None:
     write_snapshot(path, replica.state, replica.version_vector)
     state, _ = load_snapshot(path)
 
-    resumed = make_replica(2, start_ms=1_700_000_500_000)
+    resumed = make_replica(2, start_ms=1_700_000_010_000)
     resumed.state.text = state.text
     resumed.state.fields = state.fields
     resumed.state.tags = state.tags
@@ -122,7 +122,7 @@ def build(
     count: int = 3, *, seed: int = 0, profile: NetworkProfile | None = None
 ) -> NetworkSimulator:
     replicas = {
-        f"r{index}": make_replica(index + 1, start_ms=1_700_000_000_000 + index * 1_000_000)
+        f"r{index}": make_replica(index + 1, start_ms=1_700_000_000_000 + index * 10_000)
         for index in range(count)
     }
     return NetworkSimulator(replicas, seed=seed, profile=profile)

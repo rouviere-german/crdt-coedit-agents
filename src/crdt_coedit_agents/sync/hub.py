@@ -6,8 +6,12 @@ operation it checks, in this order:
 1. **signature and identity** — Ed25519 over the canonical envelope, with the replica id
    recomputed from the presented public key;
 2. **authorization** — the connection's role and the replica id the token pins;
-3. **replay** — the unique ``(doc_id, replica_id, author_seq)`` constraint on the log;
-4. **size** — the document may not grow past the configured limit.
+3. **clock** — the operation's hybrid-logical timestamp may not be further than
+   :data:`~crdt_coedit_agents.crdt.hlc.MAX_DRIFT_MS` ahead of the server's wall clock, so no client
+   can pin a last-writer-wins register (a document field, or a suggestion's accept flag) by dating
+   its write in the far future;
+4. **replay** — the unique ``(doc_id, replica_id, author_seq)`` constraint on the log;
+5. **size** — the document may not grow past the configured limit.
 
 Only then is the operation appended to the hash-chained log and applied to the server's own
 replica of the document, and only operations that got that far are relayed to subscribers. The
@@ -32,6 +36,7 @@ from typing import Final
 from crdt_coedit_agents.agentic.audit import AuditLog
 from crdt_coedit_agents.core.logging import get_logger
 from crdt_coedit_agents.crdt.document import DocumentState
+from crdt_coedit_agents.crdt.hlc import ClockDriftError, check_drift, wall_clock_ms
 from crdt_coedit_agents.crdt.ids import VersionVector
 from crdt_coedit_agents.metrics import SyncMetrics, create_sync_metrics
 from crdt_coedit_agents.ops.apply import OpRejectedError, apply_op
@@ -223,6 +228,11 @@ class DocumentHub:
         except AuthorizationError:
             self._audit_reject(grant, signed, "authorization")
             return "authorization"
+        try:
+            check_drift(signed.op.timestamp, wall_clock_ms())
+        except ClockDriftError:
+            self._audit_reject(grant, signed, "clock_drift")
+            return "clock_drift"
         if full:
             self._audit_reject(grant, signed, "document_full")
             return "document_full"

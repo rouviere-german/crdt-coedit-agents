@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from crdt_coedit_agents.crdt.fugue import UnknownAnchorError
-from crdt_coedit_agents.crdt.hlc import Timestamp
+from crdt_coedit_agents.crdt.hlc import MAX_DRIFT_MS, Timestamp
 from crdt_coedit_agents.crdt.ids import Dot, VersionVector
 from crdt_coedit_agents.ops.apply import OpRejectedError, apply_op
-from crdt_coedit_agents.ops.model import Delta, FieldSet, TextInsert, UnsignedOp
+from crdt_coedit_agents.ops.model import Delta, FieldSet, SignedOp, TextInsert, UnsignedOp
 from crdt_coedit_agents.replica import ReplayError, new_suggestion_id
 from tests.conftest import make_replica, seeded_identity
 
@@ -53,7 +53,7 @@ def test_deleting_a_run_removes_consecutive_visible_elements() -> None:
 
 def test_tags_use_observed_remove_semantics() -> None:
     first = make_replica(1)
-    second = make_replica(2, start_ms=1_700_000_500_000)
+    second = make_replica(2, start_ms=1_700_000_010_000)
     first.add_tag("draft")
     second.receive(list(first.ops()))
 
@@ -68,7 +68,7 @@ def test_tags_use_observed_remove_semantics() -> None:
 
 def test_field_writes_are_last_writer_wins_across_replicas() -> None:
     first = make_replica(1)
-    second = make_replica(2, start_ms=1_700_000_500_000)
+    second = make_replica(2, start_ms=1_700_000_010_000)
     first.set_field("title", "from-first")
     second.set_field("title", "from-second")
     first.receive(list(second.ops()))
@@ -97,7 +97,7 @@ def test_suggestion_ids_are_unguessable_and_unique() -> None:
 def test_receiving_the_same_operation_twice_is_a_duplicate_not_an_error() -> None:
     source = make_replica(1)
     source.insert_text("ab")
-    target = make_replica(2, start_ms=1_700_000_500_000)
+    target = make_replica(2, start_ms=1_700_000_010_000)
     first = target.receive(list(source.ops()))
     second = target.receive(list(source.ops()))
     assert (first.received, first.applied, first.duplicates) == (2, 2, 0)
@@ -118,7 +118,7 @@ def test_a_reused_sequence_number_with_different_content_is_a_replay() -> None:
             payload=TextInsert(value="z"),
         )
     )
-    target = make_replica(2, start_ms=1_700_000_500_000)
+    target = make_replica(2, start_ms=1_700_000_010_000)
     target.receive(list(source.ops()))
     with pytest.raises(ReplayError, match="already used"):
         target.receive([forged])
@@ -141,7 +141,7 @@ def test_a_forged_signature_never_reaches_the_state() -> None:
     forged = signed.model_copy(
         update={"op": signed.op.model_copy(update={"payload": TextInsert(value="z")})}
     )
-    target = make_replica(2, start_ms=1_700_000_500_000)
+    target = make_replica(2, start_ms=1_700_000_010_000)
     with pytest.raises(ValueError, match="does not verify"):
         target.receive([forged])
     assert target.view().text == ""
@@ -167,8 +167,8 @@ def test_operations_can_arrive_in_any_order_and_still_converge() -> None:
     source.insert_text("hello world")
     ops = list(source.ops())
 
-    forward = make_replica(2, start_ms=1_700_000_500_000)
-    backward = make_replica(3, start_ms=1_700_001_000_000)
+    forward = make_replica(2, start_ms=1_700_000_010_000)
+    backward = make_replica(3, start_ms=1_700_000_020_000)
     forward.receive(ops)
     backward.receive(list(reversed(ops)))
     assert forward.state_hash() == backward.state_hash() == source.state_hash()
@@ -207,3 +207,54 @@ def test_an_unsupported_document_for_apply_is_reported() -> None:
     )
     with pytest.raises(OpRejectedError, match="not 'test-doc'"):
         apply_op(replica.state, signed)
+
+
+def far_future_op(index: int, doc_id: str, *, wall_ms: int, seq: int = 1) -> SignedOp:
+    """A properly signed operation whose hybrid-logical timestamp is dated ``wall_ms``."""
+    identity = seeded_identity(index)
+    return identity.sign(
+        UnsignedOp(
+            doc_id=doc_id,
+            replica_id=identity.replica_id,
+            seq=seq,
+            ts=Timestamp(wall_ms, 0, identity.replica_id).encode(),
+            payload=FieldSet(key="title", value="PWNED"),
+        )
+    )
+
+
+def test_an_operation_dated_far_in_the_future_is_refused_on_receive() -> None:
+    target = make_replica(1)
+    evil = far_future_op(2, target.doc_id, wall_ms=999_999_999_999_999)
+
+    report = target.receive([evil])
+
+    assert (report.received, report.applied, report.rejected) == (1, 0, 1)
+    assert target.view().fields == {}
+    assert target.op_count == 0
+    # And the honest writer still wins afterwards, which is the point of the bound.
+    target.set_field("title", "honest")
+    assert target.view().fields == {"title": "honest"}
+
+
+def test_an_operation_just_inside_the_drift_bound_is_still_accepted() -> None:
+    target = make_replica(1)
+    inside = far_future_op(2, target.doc_id, wall_ms=1_700_000_000_001 + MAX_DRIFT_MS)
+
+    report = target.receive([inside])
+
+    assert (report.applied, report.rejected) == (1, 0)
+    assert target.view().fields == {"title": "PWNED"}
+
+
+def test_receiving_a_remote_timestamp_pulls_the_local_clock_past_it() -> None:
+    """The clock is hybrid *logical*: a write that follows a remote one also sorts after it."""
+    ahead = make_replica(2, start_ms=1_700_000_030_000)
+    behind = make_replica(1)
+    remote = ahead.set_field("status", "from-ahead")
+
+    behind.receive([remote])
+    local = behind.set_field("status", "from-behind")
+
+    assert local.op.timestamp > remote.op.timestamp
+    assert behind.view().fields == {"status": "from-behind"}

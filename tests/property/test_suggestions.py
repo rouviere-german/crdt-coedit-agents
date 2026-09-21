@@ -53,7 +53,7 @@ def _scenario(
 ) -> tuple[Replica, Replica, str, list[SignedOp]]:
     """A human writes, an agent suggests, the human keeps editing, then everything merges."""
     human = make_replica(1)
-    agent = make_replica(2, start_ms=1_700_000_500_000)
+    agent = make_replica(2, start_ms=1_700_000_010_000)
     human.insert_text(base)
     agent.receive(list(human.ops()))
 
@@ -136,7 +136,7 @@ def test_accepting_and_then_rejecting_is_the_last_writer_that_wins(
     human.decide(SUGGESTION, accept=False)
     agent.receive(list(human.ops()))
     # Delivering the two decisions in the other order reaches the same answer.
-    third = make_replica(3, start_ms=1_700_001_000_000)
+    third = make_replica(3, start_ms=1_700_000_020_000)
     third.receive(list(reversed(list(human.ops()))))
 
     assert human.state.status(SUGGESTION) == "rejected"
@@ -149,8 +149,8 @@ def test_two_suggestions_at_one_anchor_stay_separate(
     base: str, position: int, addition: str
 ) -> None:
     human = make_replica(1)
-    first_agent = make_replica(2, start_ms=1_700_000_500_000)
-    second_agent = make_replica(3, start_ms=1_700_001_000_000)
+    first_agent = make_replica(2, start_ms=1_700_000_010_000)
+    second_agent = make_replica(3, start_ms=1_700_000_020_000)
     human.insert_text(base)
     for agent in (first_agent, second_agent):
         agent.receive(list(human.ops()))

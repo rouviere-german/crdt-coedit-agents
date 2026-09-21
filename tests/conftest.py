@@ -91,7 +91,12 @@ def manual_clock(start: int = 1_700_000_000_000) -> Callable[[], int]:
 
 
 def make_replica(index: int, doc_id: str = DOC_ID, *, start_ms: int = 1_700_000_000_000) -> Replica:
-    """A replica with a deterministic identity and a deterministic clock."""
+    """A replica with a deterministic identity and a deterministic clock.
+
+    Tests that give peers different ``start_ms`` values keep the spread inside
+    :data:`~crdt_coedit_agents.crdt.hlc.MAX_DRIFT_MS`: a replica refuses an operation dated further
+    ahead than that, so a wider skew would model clocks the protocol does not accept.
+    """
     identity = seeded_identity(index)
     clock = HybridLogicalClock(identity.replica_id, now_ms=manual_clock(start_ms))
     return Replica(identity, doc_id, clock=clock)

@@ -81,7 +81,7 @@ def build_agent(
         budget=ledger,
         max_steps=8,
     )
-    replica = make_replica(2, DOC, start_ms=1_700_000_500_000)
+    replica = make_replica(2, DOC, start_ms=1_700_000_010_000)
     replica.receive(base_ops)
     agent = AgentReplica(replica, planner, approvals=store, audit=audit, principal="agent:one")
     return agent, store, audit

@@ -75,7 +75,7 @@ def new_hub(**limits: int) -> DocumentHub:
 
 
 def new_hub_replica(index: int) -> Replica:
-    return make_replica(index, start_ms=1_700_000_000_000 + index * 1_000_000)
+    return make_replica(index, start_ms=1_700_000_000_000 + index * 10_000)
 
 
 async def connect(

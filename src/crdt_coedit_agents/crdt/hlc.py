@@ -20,7 +20,15 @@ from dataclasses import dataclass
 
 from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN
 
-__all__ = ["MAX_COUNTER", "MAX_DRIFT_MS", "ClockDriftError", "HybridLogicalClock", "Timestamp"]
+__all__ = [
+    "MAX_COUNTER",
+    "MAX_DRIFT_MS",
+    "ClockDriftError",
+    "HybridLogicalClock",
+    "Timestamp",
+    "check_drift",
+    "wall_clock_ms",
+]
 
 MAX_DRIFT_MS = 60_000
 MAX_COUNTER = 2**16 - 1
@@ -93,11 +101,7 @@ class HybridLogicalClock:
         local wall time, so a replica cannot fast-forward its peers.
         """
         physical = self._now_ms()
-        if remote.wall_ms > physical + MAX_DRIFT_MS:
-            raise ClockDriftError(
-                f"remote timestamp is {remote.wall_ms - physical} ms ahead of local time "
-                f"(limit {MAX_DRIFT_MS} ms)"
-            )
+        check_drift(remote, physical)
         wall = max(self._wall_ms, remote.wall_ms, physical)
         if wall == self._wall_ms == remote.wall_ms:
             counter = _bump(max(self._counter, remote.counter))
@@ -109,6 +113,25 @@ class HybridLogicalClock:
             counter = 0
         self._wall_ms, self._counter = wall, counter
         return Timestamp(wall, counter, self._replica_id)
+
+
+def check_drift(remote: Timestamp, now_ms: int) -> None:
+    """Raise :class:`ClockDriftError` when ``remote`` is too far ahead of ``now_ms``.
+
+    This is the bound itself, separated from :class:`HybridLogicalClock` so that components which
+    do not author operations — the sync server, for one — can refuse a far-future timestamp before
+    it reaches a log or a last-writer-wins register.
+    """
+    if remote.wall_ms > now_ms + MAX_DRIFT_MS:
+        raise ClockDriftError(
+            f"remote timestamp is {remote.wall_ms - now_ms} ms ahead of local time "
+            f"(limit {MAX_DRIFT_MS} ms)"
+        )
+
+
+def wall_clock_ms() -> int:
+    """Local wall-clock time in milliseconds since the epoch."""
+    return _wall_clock_ms()
 
 
 def _bump(counter: int) -> int:

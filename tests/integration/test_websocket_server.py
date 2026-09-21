@@ -92,7 +92,7 @@ def test_a_websocket_session_syncs_a_document_end_to_end(
 def test_a_second_client_catches_up_and_receives_relayed_edits(
     client: TestClient, hub: DocumentHub
 ) -> None:
-    owner, editor = make_replica(1), make_replica(2, start_ms=1_700_000_500_000)
+    owner, editor = make_replica(1), make_replica(2, start_ms=1_700_000_010_000)
     with client.websocket_connect(f"/v1/docs/{DOC}/sync", headers=bearer(owner)) as first:
         first.send_text(encode(Hello(doc_id=DOC)))
         first.receive_text()
@@ -168,7 +168,7 @@ def test_synchronization_is_refused_when_no_secret_is_configured(hub: DocumentHu
 def test_the_document_endpoint_shows_the_main_view_and_requires_a_key(
     client: TestClient, hub: DocumentHub
 ) -> None:
-    owner, agent = make_replica(1), make_replica(2, start_ms=1_700_000_500_000)
+    owner, agent = make_replica(1), make_replica(2, start_ms=1_700_000_010_000)
     with client.websocket_connect(f"/v1/docs/{DOC}/sync", headers=bearer(owner)) as socket:
         socket.send_text(encode(Hello(doc_id=DOC)))
         socket.receive_text()

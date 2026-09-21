@@ -58,7 +58,7 @@ def edit(replica: Replica, action: str, choice: int, suggestion_id: str | None) 
 
 def build(count: int, seed: int = 0, profile: NetworkProfile | None = None) -> NetworkSimulator:
     replicas = {
-        f"r{index}": make_replica(index + 1, start_ms=1_700_000_000_000 + index * 1_000_000)
+        f"r{index}": make_replica(index + 1, start_ms=1_700_000_000_000 + index * 10_000)
         for index in range(count)
     }
     return NetworkSimulator(replicas, seed=seed, profile=profile)
