@@ -1,0 +1,12 @@
+# Normalize to LF in the repository. The Makefile, the Dockerfile and the compose shell commands
+# run on Linux in CI and in containers, where CRLF would break them.
+* text=auto eol=lf
+
+# Binary-ish files git should never touch.
+*.png binary
+*.jpg binary
+*.ico binary
+*.sqlite3 binary
+
+# uv.lock is generated; keep it out of diff noise but still reviewable.
+uv.lock linguist-generated=true
