@@ -210,9 +210,21 @@ class Replica:
         return self._emit(payload, suggestion_id)
 
     def decide(self, suggestion_id: str, *, accept: bool, reason: str | None = None) -> SignedOp:
-        """Accept or reject a suggestion. Always a main-scope operation."""
+        """Accept or reject a suggestion. Always a main-scope operation.
+
+        The decision seals in exactly the operations of the suggestion this replica can see right
+        now. An operation that reaches the document later — because the agent kept working, or
+        because it was held back until the decision was made — is outside the seal and stays
+        invisible in the main view, so accepting cannot be widened after the fact.
+        """
         return self._emit(
-            SuggestionDecide(suggestion_id=suggestion_id, accept=accept, reason=reason), None
+            SuggestionDecide(
+                suggestion_id=suggestion_id,
+                accept=accept,
+                reason=reason,
+                sealed=self._state.suggestion_seal(suggestion_id),
+            ),
+            None,
         )
 
     # ------------------------------------------------------------------ sync

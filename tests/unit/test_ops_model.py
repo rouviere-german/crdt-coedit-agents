@@ -10,6 +10,7 @@ from crdt_coedit_agents.ops.model import (
     MAX_FIELD_DEPTH,
     MAX_FIELD_VALUE_BYTES,
     MAX_OPS_PER_DELTA,
+    MAX_SEAL_RUNS,
     MAX_TEXT_VALUE_BYTES,
     Delta,
     FieldSet,
@@ -130,4 +131,24 @@ def test_signed_operations_expose_their_identity() -> None:
     with pytest.raises(ValidationError):
         signed.model_copy(update={"signature": "zz"}).model_validate(
             {"op": signed.op, "public_key": signed.public_key, "signature": "zz"}
+        )
+
+
+def test_a_decision_seals_a_bounded_list_of_well_formed_runs() -> None:
+    replica_id = "a" * 32
+    decide = SuggestionDecide(
+        suggestion_id="sg-" + "1" * 16, accept=True, sealed=(f"{replica_id}.3-7",)
+    )
+    assert decide.sealed == (f"{replica_id}.3-7",)
+    assert SuggestionDecide(suggestion_id="sg-" + "1" * 16, accept=False).sealed == ()
+
+    with pytest.raises(ValidationError, match="sealed runs must look like"):
+        SuggestionDecide(suggestion_id="sg-" + "1" * 16, accept=True, sealed=(f"{replica_id}.3",))
+    with pytest.raises(ValidationError, match="may not run backwards"):
+        SuggestionDecide(suggestion_id="sg-" + "1" * 16, accept=True, sealed=(f"{replica_id}.9-3",))
+    with pytest.raises(ValidationError, match="at most"):
+        SuggestionDecide(
+            suggestion_id="sg-" + "1" * 16,
+            accept=True,
+            sealed=tuple(f"{replica_id}.{n}-{n}" for n in range(1, MAX_SEAL_RUNS + 2)),
         )

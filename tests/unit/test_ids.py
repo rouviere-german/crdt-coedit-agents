@@ -6,7 +6,14 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from crdt_coedit_agents.crdt.ids import Dot, VersionVector, format_dot, parse_dot
+from crdt_coedit_agents.crdt.ids import (
+    Dot,
+    VersionVector,
+    compress_dots,
+    format_dot,
+    parse_dot,
+    parse_dot_ranges,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -94,3 +101,28 @@ def test_from_dots_accepts_any_order_of_a_contiguous_run(sequence: list[int]) ->
     contiguous = list(range(1, max(sequence) + 1))
     dots = (Dot(replica_id=A, seq=seq) for seq in reversed(contiguous))
     assert VersionVector.from_dots(dots).get(A) == max(sequence)
+
+
+def test_compressing_dots_keeps_gaps_and_round_trips() -> None:
+    dots = [Dot(replica_id=A, seq=seq) for seq in (5, 6, 7, 9)]
+    dots.append(Dot(replica_id=B, seq=2))
+    runs = compress_dots(dots)
+
+    assert runs == (f"{A}.5-7", f"{A}.9-9", f"{B}.2-2")
+    ranges = parse_dot_ranges(runs)
+    assert ranges == {A: ((5, 7), (9, 9)), B: ((2, 2),)}
+    expanded = {
+        Dot(replica_id=replica_id, seq=seq)
+        for replica_id, items in ranges.items()
+        for low, high in items
+        for seq in range(low, high + 1)
+    }
+    assert expanded == set(dots)
+    assert compress_dots([]) == ()
+
+
+def test_malformed_dot_ranges_are_refused() -> None:
+    with pytest.raises(ValueError, match="malformed dot range"):
+        parse_dot_ranges([f"{A}.5"])
+    with pytest.raises(ValueError, match="malformed dot range"):
+        parse_dot_ranges(["nope.1-2"])

@@ -18,24 +18,68 @@ Two scopes matter:
 ``editing_scope(suggestion_id)``
     what an editor may anchor to while writing that suggestion: the main view plus its own
     suggestion. A main edit uses ``editing_scope(None)``, which is the main view.
+
+Sealing
+-------
+A decision does not merely say *yes*; it says *yes, to exactly these operations*. The register
+holds ``{"accept": bool, "seal": [...]}``, where the seal names the operations the decider could
+see, compressed into contiguous ``(replica, seq)`` runs. An element of an accepted suggestion is
+visible only when the operation that created it is inside the seal, so operations added to a
+suggestion after it was decided are inert: they are stored, they replicate, and they are invisible
+in every main view, for ever. Without that, ``accept`` bound only a suggestion *id*, and an agent
+could keep appending to an id a human had already approved.
+
+The seal names an exact set rather than a high-water mark, because an operation the decider had not
+yet seen must stay outside it even when its sequence number is below the highest one that was
+reviewed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import JsonValue
 
 from crdt_coedit_agents.core.canonical import canonical_json, sha256_hex
-from crdt_coedit_agents.crdt.fugue import FugueNode, FugueTree, Side
+from crdt_coedit_agents.crdt.fugue import FugueNode, FugueTree, Side, Tombstone
 from crdt_coedit_agents.crdt.hlc import Timestamp
-from crdt_coedit_agents.crdt.ids import parse_dot
+from crdt_coedit_agents.crdt.ids import Dot, compress_dots, parse_dot, parse_dot_ranges
 from crdt_coedit_agents.crdt.lww import LWWEntry, LWWMap, VisibilityFilter
 from crdt_coedit_agents.crdt.orset import ORSet, Tag, TagRemoval
 
-__all__ = ["DocumentState", "DocumentView", "Scope", "SuggestionStatus"]
+__all__ = [
+    "STATE_VERSION",
+    "DocumentState",
+    "DocumentView",
+    "Scope",
+    "SuggestionStatus",
+    "decision_value",
+]
+
+#: Version of the serialized state. Bumped when the encoding changes shape, so an older snapshot is
+#: refused loudly instead of being read as something it is not.
+STATE_VERSION = 2
+
+#: How a decision is stored in the ``decisions`` register map.
+SealRanges = Mapping[str, tuple[tuple[int, int], ...]]
+
+
+def decision_value(*, accept: bool, seal: Sequence[str]) -> dict[str, Any]:
+    """The register value one ``suggestion_decide`` operation writes."""
+    return {"accept": accept, "seal": list(seal)}
+
+
+def _read_decision(entry: LWWEntry) -> tuple[bool, tuple[str, ...]]:
+    """``(accept, seal runs)`` for one decision register. A value that is not a decision
+    object accepts nothing, which is the safe reading of a state nobody signed."""
+    value = entry.value
+    if isinstance(value, Mapping):
+        raw = value.get("seal")
+        runs = tuple(str(item) for item in raw) if isinstance(raw, list) else ()
+        return value.get("accept") is True, runs
+    return value is True, ()
 
 
 class SuggestionStatus:
@@ -48,16 +92,25 @@ class SuggestionStatus:
 
 @dataclass(frozen=True, slots=True)
 class Scope:
-    """A visibility filter over suggestion ids, with a stable name for logs and metrics."""
+    """A visibility filter over ``(suggestion_id, author)``, named for logs and metrics.
+
+    ``extra`` is the suggestion currently being drafted: its author sees the whole draft, sealed or
+    not, because that is the thing under review. Everything else must be both accepted *and* inside
+    that decision's seal.
+    """
 
     name: str
     accepted: frozenset[str]
     extra: str | None = None
+    seals: Mapping[str, SealRanges] = field(default_factory=dict, hash=False)
 
-    def __call__(self, suggestion_id: str | None) -> bool:
-        if suggestion_id is None:
+    def __call__(self, suggestion_id: str | None, author: Dot | None) -> bool:
+        if suggestion_id is None or suggestion_id == self.extra:
             return True
-        return suggestion_id in self.accepted or suggestion_id == self.extra
+        if suggestion_id not in self.accepted or author is None:
+            return False
+        ranges = self.seals.get(suggestion_id, {}).get(author.replica_id, ())
+        return any(low <= author.seq <= high for low, high in ranges)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,8 +180,8 @@ class DocumentState:
         for node in self.text.nodes():
             if node.suggestion_id is not None:
                 found.add(node.suggestion_id)
-        for _, scopes in self.text.tombstones():
-            found.update(scope for scope in scopes if scope is not None)
+        for _, marks in self.text.tombstones():
+            found.update(mark.scope for mark in marks if mark.scope is not None)
         for (_, suggestion_id), _ in self.fields.items():
             if suggestion_id is not None:
                 found.add(suggestion_id)
@@ -142,12 +195,57 @@ class DocumentState:
         entry = self.decisions.entry(suggestion_id)
         if entry is None:
             return SuggestionStatus.PENDING
-        return SuggestionStatus.ACCEPTED if entry.value is True else SuggestionStatus.REJECTED
+        accept, _ = _read_decision(entry)
+        return SuggestionStatus.ACCEPTED if accept else SuggestionStatus.REJECTED
 
     def accepted_suggestions(self) -> frozenset[str]:
         # LWWMap.keys() returns a frozenset of register names, not a mapping view.
         decided = self.decisions.keys()
         return frozenset(key for key in decided if self.status(key) == SuggestionStatus.ACCEPTED)
+
+    def seal_of(self, suggestion_id: str) -> tuple[str, ...]:
+        """The operations one decision sealed in, as contiguous ``(replica, seq)`` runs."""
+        entry = self.decisions.entry(suggestion_id)
+        return () if entry is None else _read_decision(entry)[1]
+
+    def _seals(self, accepted: frozenset[str]) -> dict[str, SealRanges]:
+        return {key: parse_dot_ranges(self.seal_of(key)) for key in accepted}
+
+    def suggestion_authors(self, suggestion_id: str) -> tuple[Dot, ...]:
+        """Every operation that contributed to one suggestion, by dot.
+
+        Raises ``ValueError`` when an element of the suggestion does not record its author, because
+        such an element cannot be sealed and would silently vanish from an accepted suggestion.
+        """
+        dots: list[Dot] = []
+
+        def take(author: Dot | None, what: str) -> None:
+            if author is None:
+                raise ValueError(f"{what} of suggestion {suggestion_id} has no recorded author")
+            dots.append(author)
+
+        for node in self.text.nodes():
+            if node.suggestion_id == suggestion_id:
+                dots.append(node.dot)
+        for _, marks in self.text.tombstones():
+            for mark in marks:
+                if mark.scope == suggestion_id:
+                    take(mark.author, "a delete")
+        for (_, scope), entry in self.fields.items():
+            if scope == suggestion_id:
+                take(entry.author, "a field write")
+        adds, removes = self.tags.state_items()
+        for tag in adds:
+            if tag.suggestion_id == suggestion_id:
+                dots.append(tag.dot)
+        for removal in removes:
+            if removal.suggestion_id == suggestion_id:
+                take(removal.author, "a tag removal")
+        return tuple(dots)
+
+    def suggestion_seal(self, suggestion_id: str) -> tuple[str, ...]:
+        """The seal a reviewer deciding *now* would write: exactly what this replica can see."""
+        return compress_dots(self.suggestion_authors(suggestion_id))
 
     def pending_suggestions(self) -> tuple[str, ...]:
         decided = self.decisions.keys()
@@ -156,17 +254,20 @@ class DocumentState:
     # ----------------------------------------------------------------- scopes
 
     def main_scope(self) -> Scope:
-        """The main view: main elements plus every accepted suggestion."""
-        return Scope(name="main", accepted=self.accepted_suggestions())
+        """The main view: main elements plus the sealed part of every accepted suggestion."""
+        accepted = self.accepted_suggestions()
+        return Scope(name="main", accepted=accepted, seals=self._seals(accepted))
 
     def editing_scope(self, suggestion_id: str | None) -> Scope:
         """What an editor writing ``suggestion_id`` may anchor to."""
         if suggestion_id is None:
             return self.main_scope()
+        accepted = self.accepted_suggestions()
         return Scope(
             name=f"suggestion:{suggestion_id}",
-            accepted=self.accepted_suggestions(),
+            accepted=accepted,
             extra=suggestion_id,
+            seals=self._seals(accepted),
         )
 
     # ---------------------------------------------------------- materializing
@@ -191,7 +292,7 @@ class DocumentState:
         """
         adds, removes = self.tags.state_items()
         return {
-            "v": 1,
+            "v": STATE_VERSION,
             "doc_id": self.doc_id,
             "text_nodes": [
                 {
@@ -204,8 +305,17 @@ class DocumentState:
                 for node in self.text.nodes()
             ],
             "text_tombstones": [
-                {"dot": str(dot), "scopes": sorted(s if s is not None else "" for s in scopes)}
-                for dot, scopes in self.text.tombstones()
+                {
+                    "dot": str(dot),
+                    "marks": [
+                        {
+                            "scope": mark.scope,
+                            "author": str(mark.author) if mark.author is not None else None,
+                        }
+                        for mark in sorted(marks, key=Tombstone.sort_key)
+                    ],
+                }
+                for dot, marks in self.text.tombstones()
             ],
             "fields": [
                 {
@@ -213,6 +323,7 @@ class DocumentState:
                     "suggestion_id": suggestion_id,
                     "value": entry.value,
                     "ts": entry.timestamp.encode(),
+                    "author": str(entry.author) if entry.author is not None else None,
                 }
                 for (key, suggestion_id), entry in self.fields.items()
             ],
@@ -221,7 +332,12 @@ class DocumentState:
                 for tag in adds
             ],
             "tag_removes": [
-                {"dot": str(item.dot), "suggestion_id": item.suggestion_id} for item in removes
+                {
+                    "dot": str(item.dot),
+                    "suggestion_id": item.suggestion_id,
+                    "author": str(item.author) if item.author is not None else None,
+                }
+                for item in removes
             ],
             "decisions": [
                 {"suggestion_id": key, "value": entry.value, "ts": entry.timestamp.encode()}
@@ -232,7 +348,7 @@ class DocumentState:
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> DocumentState:
         """Rebuild a state from :meth:`to_json`. Raises ``ValueError`` on anything malformed."""
-        if payload.get("v") != 1:
+        if payload.get("v") != STATE_VERSION:
             raise ValueError("unsupported document state version")
         doc_id = payload["doc_id"]
         if not isinstance(doc_id, str):
@@ -250,12 +366,20 @@ class DocumentState:
                 )
             )
         for item in payload["text_tombstones"]:
-            for scope in item["scopes"]:
-                state.text.tombstone(parse_dot(item["dot"]), scope or None)
+            for mark in item["marks"]:
+                state.text.tombstone(
+                    parse_dot(item["dot"]),
+                    mark["scope"],
+                    _optional_dot(mark["author"]),
+                )
         for item in payload["fields"]:
             state.fields.set(
                 item["key"],
-                LWWEntry(value=item["value"], timestamp=Timestamp.decode(item["ts"])),
+                LWWEntry(
+                    value=item["value"],
+                    timestamp=Timestamp.decode(item["ts"]),
+                    author=_optional_dot(item["author"]),
+                ),
                 item["suggestion_id"],
             )
         for item in payload["tag_adds"]:
@@ -268,7 +392,11 @@ class DocumentState:
             )
         for item in payload["tag_removes"]:
             state.tags.remove(
-                TagRemoval(dot=parse_dot(item["dot"]), suggestion_id=item["suggestion_id"])
+                TagRemoval(
+                    dot=parse_dot(item["dot"]),
+                    suggestion_id=item["suggestion_id"],
+                    author=_optional_dot(item["author"]),
+                )
             )
         for item in payload["decisions"]:
             state.decisions.set(
@@ -299,7 +427,9 @@ class DocumentState:
                 if node.suggestion_id == suggestion_id
             ],
             "text_tombstones": [
-                str(dot) for dot, scopes in self.text.tombstones() if suggestion_id in scopes
+                str(dot)
+                for dot, marks in self.text.tombstones()
+                if any(mark.scope == suggestion_id for mark in marks)
             ],
             "fields": [
                 {"key": key, "value": entry.value, "ts": entry.timestamp.encode()}
@@ -329,7 +459,11 @@ class DocumentState:
 
     def suggestion_deletions(self, suggestion_id: str) -> int:
         """How many existing elements this suggestion would delete."""
-        return sum(1 for _, scopes in self.text.tombstones() if suggestion_id in scopes)
+        return sum(
+            1
+            for _, marks in self.text.tombstones()
+            if any(mark.scope == suggestion_id for mark in marks)
+        )
 
     def suggestion_digest(self, suggestion_id: str) -> str:
         """SHA-256 of :meth:`suggestion_payload`: the identity of what a reviewer approved."""
@@ -347,3 +481,12 @@ class DocumentState:
         )
         tag_bytes = sum(len(tag.element.encode("utf-8")) for tag in self.tags.tags())
         return text_bytes + field_bytes + tag_bytes
+
+
+def _optional_dot(value: Any) -> Dot | None:
+    """Parse an author dot from a snapshot. ``None`` means the element predates any operation."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("an author must be a dot string or null")  # noqa: TRY004 - a value error
+    return parse_dot(value)

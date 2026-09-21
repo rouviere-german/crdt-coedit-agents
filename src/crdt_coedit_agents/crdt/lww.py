@@ -13,6 +13,11 @@ again, with no rewriting, re-signing or rebasing.
 Deleting a key is writing ``None``: the tombstone is itself a timestamped entry, so a delete
 concurrent with a write is resolved by timestamp instead of silently losing one of them.
 
+Every entry also records the ``author`` dot of the operation that wrote it. The value itself never
+depends on it — the comparison is by timestamp alone — but a visibility filter needs to know *which
+operation* a suggested write came from, so that accepting a suggestion can seal in exactly the
+writes a reviewer saw. See :class:`~crdt_coedit_agents.crdt.document.Scope`.
+
 Algebraically this is a product of independent per-register semilattices, so commutativity,
 associativity and idempotence follow from the per-register maximum
 (``tests/property/test_algebra.py``).
@@ -26,19 +31,29 @@ from dataclasses import dataclass
 from pydantic import JsonValue
 
 from crdt_coedit_agents.crdt.hlc import Timestamp
+from crdt_coedit_agents.crdt.ids import Dot
 
-__all__ = ["LWWEntry", "LWWMap", "RegisterKey", "VisibilityFilter"]
+__all__ = ["LWWEntry", "LWWMap", "RegisterKey", "VisibilityFilter", "main_only"]
 
 RegisterKey = tuple[str, str | None]
-VisibilityFilter = Callable[[str | None], bool]
+#: ``(suggestion_id, author)`` -> is this element in the view? ``author`` is the dot of the
+#: operation that created the element, or ``None`` when the element was built by hand.
+VisibilityFilter = Callable[[str | None, "Dot | None"], bool]
+
+
+def main_only(suggestion_id: str | None, author: Dot | None) -> bool:
+    """The default filter: the main document, and nothing suggested."""
+    del author
+    return suggestion_id is None
 
 
 @dataclass(frozen=True, slots=True)
 class LWWEntry:
-    """One register reading: the value written and when."""
+    """One register reading: the value written, when, and by which operation."""
 
     value: JsonValue
     timestamp: Timestamp
+    author: Dot | None = None
 
     def wins_over(self, other: LWWEntry) -> bool:
         return self.timestamp > other.timestamp
@@ -101,15 +116,13 @@ class LWWMap:
         """The entry that wins for ``key`` among the scopes ``is_visible`` accepts."""
         best: LWWEntry | None = None
         for (entry_key, suggestion_id), entry in self._entries.items():
-            if entry_key != key or not is_visible(suggestion_id):
+            if entry_key != key or not is_visible(suggestion_id, entry.author):
                 continue
             if best is None or entry.wins_over(best):
                 best = entry
         return best
 
-    def materialize(
-        self, is_visible: VisibilityFilter = lambda scope: scope is None
-    ) -> dict[str, JsonValue]:
+    def materialize(self, is_visible: VisibilityFilter = main_only) -> dict[str, JsonValue]:
         """Materialize the visible map. Keys whose winning entry is ``None`` are absent."""
         result: dict[str, JsonValue] = {}
         for key in sorted(self.keys()):

@@ -337,3 +337,121 @@ def test_review_items_survive_a_store_reopened_from_disk(tmp_path: Path) -> None
     assert [item.suggestion_id for item in items] == [result.suggestion_id]
     assert agent.pending_approval(result.approval_request_id).tool == "publish_suggestion"
     assert ReviewItem.from_record(reopened.get(result.approval_request_id)).digest == result.digest
+
+
+def test_operations_added_after_the_accept_stay_invisible_for_ever(tmp_path: Path) -> None:
+    """The decision seals a set of operations, not a suggestion id.
+
+    Without the seal, `accept` bound only the id: every later operation carrying it became visible
+    the moment it arrived, with no second human decision anywhere.
+    """
+    owner, base_ops = base_document()
+    agent, store, audit = build_agent(tmp_path, base_ops)
+    result = agent.propose("Add a short upgrade note at the end.")
+    item = approve_publish(
+        store, audit, request_id=result.approval_request_id, approver="human:maintainer"
+    )
+    owner.receive(agent.publish(result.suggestion_id))
+    decide_in_document(owner, audit, item, accept=True, approver="human:maintainer")
+    reviewed = owner.view().text
+    assert reviewed.endswith(" Upgrading is a drop-in replacement.")
+
+    late = agent.replica.append_text(" Ship it without review.", suggestion_id=result.suggestion_id)
+    late.append(agent.replica.add_tag("shipped", suggestion_id=result.suggestion_id))
+    late.append(agent.replica.set_field("owner", "agent", suggestion_id=result.suggestion_id))
+    owner.receive(late)
+
+    assert owner.view().text == reviewed
+    assert owner.view().tags == ["agent-drafted"]
+    assert owner.view().fields == {"status": "in-review"}
+    # And a replica that only ever sees the final history reaches the same view.
+    fresh = make_replica(3, DOC, start_ms=1_700_000_020_000)
+    fresh.receive(list(owner.ops()))
+    assert fresh.view().text == reviewed
+    assert fresh.state_hash() == owner.state_hash()
+
+
+def test_a_late_delete_inside_an_accepted_suggestion_cannot_remove_reviewed_text(
+    tmp_path: Path,
+) -> None:
+    owner, base_ops = base_document()
+    agent, store, audit = build_agent(tmp_path, base_ops)
+    result = agent.propose("Add a short upgrade note at the end.")
+    item = approve_publish(
+        store, audit, request_id=result.approval_request_id, approver="human:maintainer"
+    )
+    owner.receive(agent.publish(result.suggestion_id))
+    decide_in_document(owner, audit, item, accept=True, approver="human:maintainer")
+    reviewed = owner.view().text
+
+    anchors = agent.replica.view(result.suggestion_id).anchors
+    owner.receive(agent.replica.delete_run(anchors[0], 5, suggestion_id=result.suggestion_id))
+
+    assert owner.view().text == reviewed
+
+
+def test_the_server_refuses_operations_for_a_suggestion_it_has_already_decided(
+    tmp_path: Path,
+) -> None:
+    owner, base_ops = base_document()
+    agent, store, audit = build_agent(tmp_path, base_ops)
+    hub = DocumentHub(OpLog())
+    owner_grant = Grant(
+        principal="user:owner", doc_id=DOC, role=Role.OWNER, replica_id=owner.replica_id
+    )
+    suggester = Grant(
+        principal="agent:one",
+        doc_id=DOC,
+        role=Role.SUGGESTER,
+        replica_id=agent.replica.replica_id,
+    )
+    hub.submit(owner_grant, base_ops)
+
+    result = agent.propose("Add a short upgrade note at the end.")
+    item = approve_publish(
+        store, audit, request_id=result.approval_request_id, approver="human:maintainer"
+    )
+    published = agent.publish(result.suggestion_id)
+    assert hub.submit(suggester, published).ok
+    owner.receive(published)
+    accepted = decide_in_document(owner, audit, item, accept=True, approver="human:maintainer")
+    assert hub.submit(owner_grant, [accepted]).ok
+    server_view = hub.state(DOC).view().text
+
+    late = agent.replica.append_text(" UNREVIEWED", suggestion_id=result.suggestion_id)
+    rejected = hub.submit(suggester, late)
+
+    assert rejected.accepted == 0
+    assert rejected.rejected == {"suggestion_decided": len(late)}
+    assert hub.state(DOC).view().text == server_view
+    # Re-sending what the log already holds is still a duplicate, not a late addition.
+    assert hub.submit(suggester, published).duplicates == len(published)
+
+
+def test_rewriting_a_decided_suggestions_register_drops_it_back_to_the_main_value(
+    tmp_path: Path,
+) -> None:
+    """The honest limit of sealing a last-writer-wins register.
+
+    A register holds one entry per ``(key, scope)``, so an agent that writes ``status`` again
+    inside its own accepted suggestion displaces the entry a human approved. The new write is
+    outside the seal and stays invisible, and the displaced one is gone, so the register falls back
+    to whatever the main document says. Nothing unreviewed appears — but the accepted value does
+    not survive its author overwriting it.
+    """
+    owner, base_ops = base_document()
+    owner_op = owner.set_field("status", "draft")
+    agent, store, audit = build_agent(tmp_path, [*base_ops, owner_op])
+    result = agent.propose("Add a short upgrade note at the end.")
+    item = approve_publish(
+        store, audit, request_id=result.approval_request_id, approver="human:maintainer"
+    )
+    owner.receive(agent.publish(result.suggestion_id))
+    decide_in_document(owner, audit, item, accept=True, approver="human:maintainer")
+    assert owner.view().fields == {"status": "in-review"}
+
+    owner.receive(
+        [agent.replica.set_field("status", "approved", suggestion_id=result.suggestion_id)]
+    )
+
+    assert owner.view().fields == {"status": "draft"}

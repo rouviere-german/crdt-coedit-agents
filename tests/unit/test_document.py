@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from crdt_coedit_agents.crdt.document import DocumentState, Scope, SuggestionStatus
+from crdt_coedit_agents.crdt.document import (
+    STATE_VERSION,
+    DocumentState,
+    Scope,
+    SuggestionStatus,
+)
 from crdt_coedit_agents.crdt.hlc import Timestamp
 from crdt_coedit_agents.crdt.ids import Dot
-from crdt_coedit_agents.crdt.lww import LWWEntry
-from crdt_coedit_agents.crdt.orset import Tag
+from crdt_coedit_agents.crdt.orset import Tag, TagRemoval
 from crdt_coedit_agents.ops.model import TextInsert, UnsignedOp
 from tests.conftest import make_replica, seeded_identity
 
@@ -72,26 +76,37 @@ def test_known_suggestions_finds_every_place_a_suggestion_can_appear() -> None:
 
 
 def test_editing_scopes_admit_main_accepted_and_the_suggestion_itself() -> None:
-    state = build()
-    state.decisions.set(OTHER, LWWEntry(value=True, timestamp=Timestamp(1, 0, "a" * 32)))
+    replica = make_replica(1)
+    replica.insert_text("hi")
+    inside = replica.insert_text("!", after=replica.view().anchors[-1], suggestion_id=OTHER)
+    replica.decide(OTHER, accept=True)
+    state = replica.state
+
     main = state.main_scope()
-    assert main(None)
-    assert main(OTHER)
-    assert not main(SUGGESTION)
+    assert main(None, None)
+    assert main(OTHER, inside[0].dot)
+    assert not main(SUGGESTION, inside[0].dot)
 
     editing = state.editing_scope(SUGGESTION)
-    assert editing(None)
-    assert editing(OTHER)
-    assert editing(SUGGESTION)
+    assert editing(None, None)
+    assert editing(OTHER, inside[0].dot)
+    assert editing(SUGGESTION, None)
     assert editing.name == f"suggestion:{SUGGESTION}"
     assert state.editing_scope(None) == main
 
 
-def test_a_scope_is_a_plain_callable_filter() -> None:
-    scope = Scope(name="x", accepted=frozenset({SUGGESTION}))
-    assert scope(None) is True
-    assert scope(SUGGESTION) is True
-    assert scope(OTHER) is False
+def test_a_scope_admits_an_accepted_suggestion_only_inside_its_seal() -> None:
+    author = "b" * 32
+    scope = Scope(
+        name="x", accepted=frozenset({SUGGESTION}), seals={SUGGESTION: {author: ((3, 5),)}}
+    )
+    assert scope(None, None) is True
+    assert scope(SUGGESTION, Dot(replica_id=author, seq=4)) is True
+    assert scope(SUGGESTION, Dot(replica_id=author, seq=6)) is False
+    assert scope(SUGGESTION, Dot(replica_id="c" * 32, seq=4)) is False
+    # An element that does not say which operation made it cannot be proved to be sealed in.
+    assert scope(SUGGESTION, None) is False
+    assert scope(OTHER, Dot(replica_id=author, seq=4)) is False
 
 
 def test_the_suggestion_digest_covers_only_that_suggestion() -> None:
@@ -146,10 +161,13 @@ def test_the_state_round_trips_through_its_json_form() -> None:
 
 def test_a_state_from_an_unknown_version_is_refused() -> None:
     payload = build().to_json()
-    payload["v"] = 2
+    payload["v"] = STATE_VERSION + 1
     with pytest.raises(ValueError, match="unsupported document state version"):
         DocumentState.from_json(payload)
     payload["v"] = 1
+    with pytest.raises(ValueError, match="unsupported document state version"):
+        DocumentState.from_json(payload)
+    payload["v"] = STATE_VERSION
     payload["doc_id"] = 5
     with pytest.raises(ValueError, match="doc_id must be a string"):
         DocumentState.from_json(payload)
@@ -198,3 +216,59 @@ def test_a_suggestion_cannot_anchor_itself_inside_another_suggestion() -> None:
     counterfactual = make_replica(3, start_ms=1_700_000_020_000)
     counterfactual.receive(list(owner.ops()))
     assert counterfactual.view().text == "HELLO"
+
+
+def test_a_withheld_operation_is_outside_the_seal_even_below_the_highest_sequence() -> None:
+    """The seal names an exact set, not a high-water mark.
+
+    An agent that holds one operation back until after the decision must not have it admitted just
+    because a later operation of the same suggestion was reviewed.
+    """
+    owner = make_replica(1)
+    owner.insert_text("Base.")
+    agent = make_replica(2, start_ms=1_700_000_010_000)
+    agent.receive(list(owner.ops()))
+    # Three independent insertions, each anchored to a different main element, so withholding one
+    # does not orphan the others.
+    anchors = agent.view().anchors
+    first = agent.insert_text("X", after=anchors[0], suggestion_id=SUGGESTION)
+    withheld = agent.insert_text("Y", after=anchors[1], suggestion_id=SUGGESTION)
+    third = agent.insert_text("Z", after=anchors[2], suggestion_id=SUGGESTION)
+
+    owner.receive([*first, *third])
+    owner.decide(SUGGESTION, accept=True)
+    reviewed = owner.view().text
+    assert "X" in reviewed
+    assert "Z" in reviewed
+    assert "Y" not in reviewed
+    assert len(owner.state.seal_of(SUGGESTION)) == 2  # two runs, with the gap preserved
+
+    owner.receive(withheld)
+
+    assert owner.view().text == reviewed
+
+
+def test_the_seal_records_every_kind_of_element_a_suggestion_can_contribute() -> None:
+    replica = make_replica(1)
+    replica.insert_text("ab")
+    anchors = replica.view().anchors
+    replica.insert_text("c", after=anchors[0], suggestion_id=SUGGESTION)
+    replica.delete_run(anchors[1], suggestion_id=SUGGESTION)
+    replica.set_field("status", "open", suggestion_id=SUGGESTION)
+    replica.add_tag("agent", suggestion_id=SUGGESTION)
+    replica.remove_tag("agent", suggestion_id=SUGGESTION)
+
+    authors = replica.state.suggestion_authors(SUGGESTION)
+
+    assert len(authors) == 5
+    assert replica.state.suggestion_seal(SUGGESTION) == (f"{replica.replica_id}.3-7",)
+
+
+def test_an_element_without_a_recorded_author_cannot_be_sealed() -> None:
+    state = DocumentState(doc_id="test-doc")
+    state.tags.add(Tag(element="x", dot=Dot(replica_id="a" * 32, seq=1), suggestion_id=SUGGESTION))
+    state.tags.remove(
+        TagRemoval(dot=Dot(replica_id="a" * 32, seq=1), suggestion_id=SUGGESTION, author=None)
+    )
+    with pytest.raises(ValueError, match="no recorded author"):
+        state.suggestion_seal(SUGGESTION)

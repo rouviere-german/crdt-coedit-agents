@@ -13,10 +13,12 @@ Tags are also partitioned by suggestion id: a suggested add is only visible in a
 its suggestion, and a suggested remove only hides tags for such views. The main view therefore sees
 exactly the set it would see if the suggestion had never been made.
 
-A removal is identified by the tag it observed *and* the scope it was made in, never by the tag
-alone. One tag can be removed independently in the main document and inside a suggestion; those are
-two separate facts, and a state that could hold only one of them would depend on which arrived
-last. Keeping both is what makes the removes half a set that only ever grows.
+A removal is identified by the tag it observed, the scope it was made in *and* the operation that
+made it, never by the tag alone. One tag can be removed independently in the main document and
+inside a suggestion, and two replicas can remove the same tag in the same scope; those are separate
+facts, and a state that could hold only one of them would depend on which arrived last. Keeping all
+of them is what makes the removes half a set that only ever grows — and recording the author is
+what lets an accepted suggestion seal in exactly the removals a reviewer saw.
 """
 
 from __future__ import annotations
@@ -25,25 +27,35 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
 from crdt_coedit_agents.crdt.ids import Dot
-from crdt_coedit_agents.crdt.lww import VisibilityFilter
+from crdt_coedit_agents.crdt.lww import VisibilityFilter, main_only
 
-__all__ = ["ORSet", "RemovalKey", "Tag", "TagRemoval"]
+__all__ = ["ORSet", "RemovalKey", "RemovalMark", "Tag", "TagRemoval"]
 
-# A removal is named by the tag it observed *and* the scope it was made in. The same tag may be
-# removed in the main document and inside a suggestion independently, and those are two distinct
-# facts: keying removals by the dot alone would let one overwrite the other, which would make the
-# state depend on delivery order.
-type RemovalKey = tuple[Dot, str | None]
+# A removal is named by the tag it observed, the scope it was made in *and* its author. The same
+# tag may be removed in the main document and inside a suggestion, and by two different replicas;
+# those are distinct facts, and keying removals by the dot alone would let one overwrite another,
+# which would make the state depend on delivery order.
+type RemovalKey = tuple[Dot, str | None, Dot | None]
+
+#: A removal as a view sees it: the scope it was made in and the operation that made it.
+type RemovalMark = tuple[str | None, Dot | None]
 
 
 def _removal_key(removal: TagRemoval) -> RemovalKey:
-    return (removal.dot, removal.suggestion_id)
+    return (removal.dot, removal.suggestion_id, removal.author)
 
 
-def _removal_sort_key(key: RemovalKey) -> tuple[Dot, bool, str]:
+def _removal_sort_key(key: RemovalKey) -> tuple[Dot, bool, str, bool, str, int]:
     """Total order over removal keys. ``None`` (the main scope) sorts before any suggestion."""
-    dot, suggestion_id = key
-    return (dot, suggestion_id is not None, suggestion_id or "")
+    dot, suggestion_id, author = key
+    return (
+        dot,
+        suggestion_id is not None,
+        suggestion_id or "",
+        author is not None,
+        author.replica_id if author is not None else "",
+        author.seq if author is not None else 0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,10 +69,11 @@ class Tag:
 
 @dataclass(frozen=True, slots=True)
 class TagRemoval:
-    """One remove: the tag that was observed, and the scope the remove was made in."""
+    """One remove: the tag observed, the scope it was made in, and the operation that made it."""
 
     dot: Dot
     suggestion_id: str | None = None
+    author: Dot | None = None
 
 
 class ORSet:
@@ -78,10 +91,10 @@ class ORSet:
         # Derived index: which scopes each tag was removed in. Keeps the removal test O(1) instead
         # of a scan over every removal, and is rebuilt from ``_removes`` alone, so it can never
         # disagree with it.
-        self._removed_scopes: dict[Dot, frozenset[str | None]] = {}
-        for dot, suggestion_id in self._removes:
+        self._removed_scopes: dict[Dot, frozenset[RemovalMark]] = {}
+        for dot, suggestion_id, author in self._removes:
             previous = self._removed_scopes.get(dot, frozenset())
-            self._removed_scopes[dot] = previous | {suggestion_id}
+            self._removed_scopes[dot] = previous | {(suggestion_id, author)}
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ORSet):
@@ -109,7 +122,7 @@ class ORSet:
             tag.dot
             for tag in self._adds.values()
             if tag.element == element
-            and is_visible(tag.suggestion_id)
+            and is_visible(tag.suggestion_id, tag.dot)
             and not self._is_removed(tag.dot, is_visible)
         )
 
@@ -130,7 +143,7 @@ class ORSet:
             return False
         self._removes[key] = removal
         previous = self._removed_scopes.get(removal.dot, frozenset())
-        self._removed_scopes[removal.dot] = previous | {removal.suggestion_id}
+        self._removed_scopes[removal.dot] = previous | {(removal.suggestion_id, removal.author)}
         return True
 
     def join(self, other: ORSet) -> ORSet:
@@ -138,14 +151,14 @@ class ORSet:
         return ORSet({**self._adds, **other._adds}, {**self._removes, **other._removes})
 
     def _is_removed(self, dot: Dot, is_visible: VisibilityFilter) -> bool:
-        """True when the tag was removed in any scope this view accepts."""
-        return any(is_visible(scope) for scope in self._removed_scopes.get(dot, ()))
+        """True when the tag was removed by any operation this view accepts."""
+        return any(is_visible(scope, author) for scope, author in self._removed_scopes.get(dot, ()))
 
-    def materialize(self, is_visible: VisibilityFilter = lambda scope: scope is None) -> list[str]:
+    def materialize(self, is_visible: VisibilityFilter = main_only) -> list[str]:
         """Sorted elements that have at least one visible, not-removed tag."""
         present: set[str] = set()
         for tag in self._adds.values():
-            if not is_visible(tag.suggestion_id) or self._is_removed(tag.dot, is_visible):
+            if not is_visible(tag.suggestion_id, tag.dot) or self._is_removed(tag.dot, is_visible):
                 continue
             present.add(tag.element)
         return sorted(present)

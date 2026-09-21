@@ -14,6 +14,10 @@ Every operation carries ``suggestion_id``. Operations with a suggestion id are i
 main view until ``suggestion_decide`` sets that suggestion to ``true``; ``suggestion_decide``
 itself may never carry one, because a suggestion that could accept itself would defeat the gate.
 
+``suggestion_decide`` accepts a *set of operations*, not an id: its ``sealed`` field names exactly
+the operations the decider could see. Operations added to the suggestion afterwards are outside the
+seal and stay invisible for ever, so an approval cannot be widened after the fact.
+
 Limits (payload size, ops per delta, field-value depth) are enforced here, in the model, so they
 apply on every path: the server, a peer receiving a delta and a replica loading a snapshot.
 """
@@ -26,13 +30,14 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from crdt_coedit_agents.crdt.hlc import Timestamp
-from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN, Dot, parse_dot
+from crdt_coedit_agents.crdt.ids import DOT_RANGE_PATTERN, REPLICA_ID_PATTERN, Dot, parse_dot
 
 __all__ = [
     "MAX_DELTA_BYTES",
     "MAX_FIELD_DEPTH",
     "MAX_FIELD_VALUE_BYTES",
     "MAX_OPS_PER_DELTA",
+    "MAX_SEAL_RUNS",
     "MAX_TAG_LENGTH",
     "MAX_TEXT_VALUE_BYTES",
     "Delta",
@@ -55,12 +60,17 @@ MAX_FIELD_DEPTH = 8
 MAX_TAG_LENGTH = 64
 MAX_OPS_PER_DELTA = 512
 MAX_DELTA_BYTES = 1_048_576
+#: How many contiguous ``(replica, seq)`` runs one decision may seal. A suggestion written the
+#: ordinary way needs one run per contributing replica; the bound is generous so that interleaved
+#: authorship still fits, and refusing beyond it keeps a decision small enough to sign and relay.
+MAX_SEAL_RUNS = 128
 
 SUGGESTION_ID_PATTERN = r"^sg-[0-9a-f]{16}$"
 FIELD_KEY_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 TAG_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9 _/-]{0,63}$"
 DOC_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,63}$"
 _ANCHOR = re.compile(r"^[0-9a-f]{32}\.[1-9][0-9]{0,17}$")
+_DOT_RANGE = re.compile(DOT_RANGE_PATTERN)
 
 
 class _Frozen(BaseModel):
@@ -170,12 +180,32 @@ class TagRemove(_Frozen):
 
 
 class SuggestionDecide(_Frozen):
-    """Accept or reject a suggestion. Always a main-scope operation."""
+    """Accept or reject a suggestion. Always a main-scope operation.
+
+    ``sealed`` names the operations of the suggestion the decider had actually seen, as contiguous
+    ``"<replica_id>.<low>-<high>"`` runs. Anything outside it is not part of the decision, so an
+    empty seal accepts nothing at all — which is the right reading of a decision that does not say
+    what it decided.
+    """
 
     kind: Literal["suggestion_decide"] = "suggestion_decide"
     suggestion_id: str = Field(pattern=SUGGESTION_ID_PATTERN)
     accept: bool
     reason: str | None = Field(default=None, max_length=280)
+    sealed: tuple[str, ...] = ()
+
+    @field_validator("sealed")
+    @classmethod
+    def _valid_runs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_SEAL_RUNS:
+            raise ValueError(f"a decision may seal at most {MAX_SEAL_RUNS} operation runs")
+        for item in value:
+            if not _DOT_RANGE.fullmatch(item):
+                raise ValueError("sealed runs must look like <replica_id>.<low>-<high>")
+            low, _, high = item.partition("-")
+            if int(low.rsplit(".", 1)[1]) > int(high):
+                raise ValueError("a sealed run may not run backwards")
+        return value
 
 
 OpPayload = Annotated[

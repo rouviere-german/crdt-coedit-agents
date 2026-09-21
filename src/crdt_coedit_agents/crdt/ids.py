@@ -11,23 +11,31 @@ operation that created them, so element identity is global, stable and needs no 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Self
 
 __all__ = [
+    "DOT_RANGE_PATTERN",
     "REPLICA_ID_PATTERN",
     "Dot",
     "VersionVector",
+    "compress_dots",
     "format_dot",
     "is_replica_id",
     "parse_dot",
+    "parse_dot_ranges",
 ]
 
 # Replica ids are derived from a public key (see ops.signing), so they are fixed-width hex.
 REPLICA_ID_PATTERN = r"^[0-9a-f]{32}$"
 _REPLICA_ID = re.compile(REPLICA_ID_PATTERN)
 _DOT = re.compile(r"^([0-9a-f]{32})\.([1-9][0-9]{0,17})$")
+
+# A contiguous run of one replica's sequence numbers, inclusive at both ends. Used to name an exact
+# *set* of operations compactly — see SuggestionDecide.sealed.
+DOT_RANGE_PATTERN = r"^[0-9a-f]{32}\.[1-9][0-9]{0,17}-[1-9][0-9]{0,17}$"
+_DOT_RANGE = re.compile(r"^([0-9a-f]{32})\.([1-9][0-9]{0,17})-([1-9][0-9]{0,17})$")
 
 
 def is_replica_id(text: str) -> bool:
@@ -63,6 +71,48 @@ def parse_dot(text: str) -> Dot:
     if match is None:
         raise ValueError(f"malformed dot: {text!r}")
     return Dot(replica_id=match.group(1), seq=int(match.group(2)))
+
+
+def compress_dots(dots: Iterable[Dot]) -> tuple[str, ...]:
+    """Name an exact set of dots as the shortest list of contiguous per-replica runs.
+
+    A run ``"<replica_id>.<lo>-<hi>"`` is only emitted when *every* sequence number between ``lo``
+    and ``hi`` is in the input, so expanding the runs gives back exactly the set that went in. That
+    exactness is the point: the runs are what a decision seals, and a gap left by an operation the
+    decider had not seen must stay a gap.
+    """
+    by_replica: dict[str, set[int]] = {}
+    for dot in dots:
+        by_replica.setdefault(dot.replica_id, set()).add(dot.seq)
+    runs: list[str] = []
+    for replica_id in sorted(by_replica):
+        low: int | None = None
+        previous: int | None = None
+        for seq in sorted(by_replica[replica_id]):
+            if low is None or previous is None:
+                low = previous = seq
+            elif seq == previous + 1:
+                previous = seq
+            else:
+                runs.append(f"{replica_id}.{low}-{previous}")
+                low = previous = seq
+        if low is not None and previous is not None:
+            runs.append(f"{replica_id}.{low}-{previous}")
+    return tuple(runs)
+
+
+def parse_dot_ranges(items: Iterable[str]) -> dict[str, tuple[tuple[int, int], ...]]:
+    """Inverse of :func:`compress_dots`: ``replica_id -> ((low, high), ...)``."""
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for item in items:
+        match = _DOT_RANGE.fullmatch(item)
+        if match is None:
+            raise ValueError(f"malformed dot range: {item!r}")
+        low, high = int(match.group(2)), int(match.group(3))
+        if low > high:
+            raise ValueError(f"dot range runs backwards: {item!r}")
+        ranges.setdefault(match.group(1), []).append((low, high))
+    return {replica_id: tuple(items) for replica_id, items in ranges.items()}
 
 
 class VersionVector:

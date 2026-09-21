@@ -11,6 +11,7 @@ from crdt_coedit_agents.crdt.fugue import (
     FugueTree,
     NodeConflictError,
     Side,
+    Tombstone,
     UnknownAnchorError,
     sibling_key,
 )
@@ -28,12 +29,13 @@ def dot(seq: int, replica_id: str = A) -> Dot:
     return Dot(replica_id=replica_id, seq=seq)
 
 
-def main_only(scope: str | None) -> bool:
+def main_only(scope: str | None, author: Dot | None = None) -> bool:
+    del author
     return scope is None
 
 
-def everything(scope: str | None) -> bool:
-    del scope
+def everything(scope: str | None, author: Dot | None = None) -> bool:
+    del scope, author
     return True
 
 
@@ -174,7 +176,9 @@ def test_join_merges_node_sets_and_tombstone_scopes() -> None:
     left.tombstone(dots[0])
     right.tombstone(dots[0], SUGGESTION)
     merged = left.join(right)
-    assert dict(merged.tombstones())[dots[0]] == frozenset({None, SUGGESTION})
+    assert dict(merged.tombstones())[dots[0]] == frozenset(
+        {Tombstone(scope=None), Tombstone(scope=SUGGESTION)}
+    )
     assert merged == right.join(left)
 
 
@@ -211,11 +215,12 @@ def test_from_items_rebuilds_an_identical_tree() -> None:
     assert rebuilt.traversal() == tree.traversal()
 
 
-def accepting(*suggestions: str) -> Callable[[str | None], bool]:
+def accepting(*suggestions: str) -> Callable[[str | None, Dot | None], bool]:
     """A view that shows the main document plus the named suggestions."""
     allowed = frozenset(suggestions)
 
-    def view(scope: str | None) -> bool:
+    def view(scope: str | None, author: Dot | None = None) -> bool:
+        del author
         return scope is None or scope in allowed
 
     return view

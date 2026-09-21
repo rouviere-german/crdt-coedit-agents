@@ -20,11 +20,13 @@ def stamp(wall_ms: int, replica_id: str = A, counter: int = 0) -> Timestamp:
     return Timestamp(wall_ms, counter, replica_id)
 
 
-def main_only(scope: str | None) -> bool:
+def main_only(scope: str | None, author: Dot | None = None) -> bool:
+    del author
     return scope is None
 
 
-def with_suggestion(scope: str | None) -> bool:
+def with_suggestion(scope: str | None, author: Dot | None = None) -> bool:
+    del author
     return scope is None or scope == SUGGESTION
 
 

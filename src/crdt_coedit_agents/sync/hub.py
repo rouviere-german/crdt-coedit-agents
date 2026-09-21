@@ -10,8 +10,10 @@ operation it checks, in this order:
    :data:`~crdt_coedit_agents.crdt.hlc.MAX_DRIFT_MS` ahead of the server's wall clock, so no client
    can pin a last-writer-wins register (a document field, or a suggestion's accept flag) by dating
    its write in the far future;
-4. **replay** — the unique ``(doc_id, replica_id, author_seq)`` constraint on the log;
-5. **size** — the document may not grow past the configured limit.
+4. **decided suggestions** — a suggestion that has already been accepted or rejected takes no
+   further operations, so an agent cannot keep appending to an id a human has signed off;
+5. **replay** — the unique ``(doc_id, replica_id, author_seq)`` constraint on the log;
+6. **size** — the document may not grow past the configured limit.
 
 Only then is the operation appended to the hash-chained log and applied to the server's own
 replica of the document, and only operations that got that far are relayed to subscribers. The
@@ -35,7 +37,7 @@ from typing import Final
 
 from crdt_coedit_agents.agentic.audit import AuditLog
 from crdt_coedit_agents.core.logging import get_logger
-from crdt_coedit_agents.crdt.document import DocumentState
+from crdt_coedit_agents.crdt.document import DocumentState, SuggestionStatus
 from crdt_coedit_agents.crdt.hlc import ClockDriftError, check_drift, wall_clock_ms
 from crdt_coedit_agents.crdt.ids import VersionVector
 from crdt_coedit_agents.metrics import SyncMetrics, create_sync_metrics
@@ -233,6 +235,9 @@ class DocumentHub:
         except ClockDriftError:
             self._audit_reject(grant, signed, "clock_drift")
             return "clock_drift"
+        if self._is_decided(signed, document):
+            self._audit_reject(grant, signed, "suggestion_decided")
+            return "suggestion_decided"
         if full:
             self._audit_reject(grant, signed, "document_full")
             return "document_full"
@@ -254,6 +259,21 @@ class DocumentHub:
         if isinstance(signed.op.payload, SuggestionDecide):
             self._audit_decision(grant, signed, signed.op.payload)
         return _APPLIED
+
+    def _is_decided(self, signed: SignedOp, document: _Document) -> bool:
+        """True when this operation belongs to a suggestion that has already been decided.
+
+        The seal on the decision already makes such an operation invisible everywhere; refusing it
+        here keeps it out of the log as well, so the evidence a reviewer looked at stays the whole
+        story. A re-send of an operation the log already holds is a duplicate, not a late addition,
+        so it is let through to the duplicate path below.
+        """
+        suggestion = signed.op.suggestion_id
+        if suggestion is None:
+            return False
+        if document.state.status(suggestion) == SuggestionStatus.PENDING:
+            return False
+        return not self._log.contains(signed.op.doc_id, signed.dot)
 
     def _reject(self, rejected: dict[str, int], reason: str, count: int) -> None:
         rejected[reason] = rejected.get(reason, 0) + count

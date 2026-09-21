@@ -137,7 +137,38 @@ and found in the first place by the randomized convergence property.
 ## Suggestions
 
 Every element carries a `suggestion_id` (`None` = main document). `decisions[suggestion_id]` is an
-ordinary LWW register: a suggestion is visible exactly when it says `true`.
+ordinary LWW register holding `{"accept": bool, "seal": [...]}`.
+
+### A decision accepts operations, not an id
+
+The seal is the load-bearing half. It names exactly the operations of the suggestion the decider
+could see, compressed into contiguous `"<replica_id>.<low>-<high>"` runs, and an element of an
+accepted suggestion is visible only when the operation that created it falls inside those runs.
+Every element therefore records its author dot: the node's own dot for an insert or a tag add, and
+the operating dot for a delete, a field write or a tag removal.
+
+Without the seal, `accept` bound only a suggestion *id*, and every operation carrying that id
+became visible the moment it arrived — for ever, with no second decision anywhere
+(`tests/integration/test_agent_review.py::test_operations_added_after_the_accept_stay_invisible_for_ever`).
+
+The seal names an exact set rather than a high-water mark, because an operation the decider had not
+yet seen has to stay outside it even when a *later* operation of the same suggestion was reviewed
+(`tests/unit/test_document.py::test_a_withheld_operation_is_outside_the_seal_even_below_the_highest_sequence`).
+`compress_dots` only emits a run when every sequence number inside it was present, so expanding the
+runs gives back exactly the set that went in.
+
+The sync server refuses operations for a suggestion it has already decided outright, with the
+rejection reason `suggestion_decided`, so they do not even reach the log
+(`tests/integration/test_agent_review.py::test_the_server_refuses_operations_for_a_suggestion_it_has_already_decided`).
+A peer-to-peer replica has no such gate and relies on the seal alone, which is why the seal, and
+not the server check, is the control.
+
+**The limit, stated plainly.** A register holds one entry per `(key, scope)`. An agent that writes
+the same field again inside its own accepted suggestion displaces the entry the human approved: the
+new write is outside the seal and invisible, and the displaced one is gone, so that key falls back
+to the main document's value. Nothing unreviewed becomes visible, but the accepted value does not
+survive its own author overwriting it
+(`tests/integration/test_agent_review.py::test_rewriting_a_decided_suggestions_register_drops_it_back_to_the_main_value`).
 
 Two scopes matter:
 

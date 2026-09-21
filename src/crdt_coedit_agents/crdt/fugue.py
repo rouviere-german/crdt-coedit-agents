@@ -39,7 +39,9 @@ as well.
 
 Scopes
 ------
-Every node and every tombstone carries a ``suggestion_id`` (``None`` for the main document).
+Every node carries a ``suggestion_id`` (``None`` for the main document), and every tombstone
+carries the scope it was made in together with the dot of the operation that made it, so a view can
+tell which delete it is looking at.
 
 * **Position resolution** happens inside the scope the edit is made in (main, or main plus one
   suggestion). A main edit therefore never becomes a child of a suggested node, so the set of main
@@ -71,16 +73,18 @@ __all__ = [
     "FugueTree",
     "NodeConflictError",
     "Side",
+    "Tombstone",
     "UnknownAnchorError",
     "sibling_key",
 ]
 
 ROOT_ID = "ROOT"
 
-ScopeFilter = Callable[[str | None], bool]
+ScopeFilter = Callable[[str | None, "Dot | None"], bool]
 
 
-def _main_only(suggestion_id: str | None) -> bool:
+def _main_only(suggestion_id: str | None, author: Dot | None) -> bool:
+    del author
     return suggestion_id is None
 
 
@@ -113,6 +117,24 @@ class FugueNode:
         return str(self.dot)
 
 
+@dataclass(frozen=True, slots=True)
+class Tombstone:
+    """One delete of one element: the scope it was made in and the operation that made it."""
+
+    scope: str | None
+    author: Dot | None = None
+
+    def sort_key(self) -> tuple[bool, str, bool, str, int]:
+        """Total order, so serialization is deterministic. ``None`` sorts first in both slots."""
+        return (
+            self.scope is not None,
+            self.scope or "",
+            self.author is not None,
+            self.author.replica_id if self.author is not None else "",
+            self.author.seq if self.author is not None else 0,
+        )
+
+
 def sibling_key(dot: Dot) -> tuple[int, str]:
     """Total order on sibling dots: ``(seq, replica_id)``."""
     return (dot.seq, dot.replica_id)
@@ -126,10 +148,10 @@ class FugueTree:
     def __init__(
         self,
         nodes: Mapping[Dot, FugueNode] | None = None,
-        tombstones: Mapping[Dot, frozenset[str | None]] | None = None,
+        tombstones: Mapping[Dot, frozenset[Tombstone]] | None = None,
     ) -> None:
         self._nodes: dict[Dot, FugueNode] = {}
-        self._tombstones: dict[Dot, frozenset[str | None]] = dict(tombstones or {})
+        self._tombstones: dict[Dot, frozenset[Tombstone]] = dict(tombstones or {})
         # parent dot (None = ROOT) -> (left children, right children), both ascending by
         # sibling_key. Left children are traversed in reverse.
         self._children: dict[Dot | None, tuple[list[Dot], list[Dot]]] = {}
@@ -172,8 +194,12 @@ class FugueTree:
         """Every node, in dot order (not list order)."""
         yield from (self._nodes[dot] for dot in sorted(self._nodes))
 
-    def tombstones(self) -> Iterator[tuple[Dot, frozenset[str | None]]]:
+    def tombstones(self) -> Iterator[tuple[Dot, frozenset[Tombstone]]]:
         yield from ((dot, self._tombstones[dot]) for dot in sorted(self._tombstones))
+
+    def deleted_in(self, target: Dot, suggestion_id: str | None) -> bool:
+        """True when ``target`` carries a tombstone made in exactly ``suggestion_id``."""
+        return any(mark.scope == suggestion_id for mark in self._tombstones.get(target, ()))
 
     def copy(self) -> FugueTree:
         """Deep enough copy to mutate independently, without re-sorting every child list."""
@@ -210,12 +236,15 @@ class FugueTree:
         """Add a node built elsewhere (a remote operation). Returns True when it was new."""
         return self._attach(node)
 
-    def tombstone(self, target: Dot, suggestion_id: str | None = None) -> bool:
-        """Mark ``target`` deleted in one scope. Returns True when that scope was new."""
-        scopes = self._tombstones.get(target, frozenset())
-        if suggestion_id in scopes:
+    def tombstone(
+        self, target: Dot, suggestion_id: str | None = None, author: Dot | None = None
+    ) -> bool:
+        """Record one delete of ``target``. Returns True when this delete was new."""
+        marks = self._tombstones.get(target, frozenset())
+        mark = Tombstone(scope=suggestion_id, author=author)
+        if mark in marks:
             return False
-        self._tombstones[target] = scopes | {suggestion_id}
+        self._tombstones[target] = marks | {mark}
         return True
 
     def join(self, other: FugueTree) -> FugueTree:
@@ -235,7 +264,7 @@ class FugueTree:
     def _in_scope(self, dot: Dot, scope: ScopeFilter) -> bool:
         """True when ``dot`` and every one of its ancestors are inside ``scope``."""
         if not self._scoped:
-            return scope(self._nodes[dot].suggestion_id)
+            return scope(self._nodes[dot].suggestion_id, dot)
         return self._scope_ok(dot, scope)
 
     def _scope_ok(self, dot: Dot, scope: ScopeFilter, memo: dict[Dot, bool] | None = None) -> bool:
@@ -252,7 +281,7 @@ class FugueTree:
                 result = memo[current]
                 break
             node = self._nodes.get(current)
-            if node is None or not scope(node.suggestion_id):
+            if node is None or not scope(node.suggestion_id, node.dot):
                 if memo is not None and node is not None:
                     memo[current] = False
                 result = False
@@ -341,7 +370,7 @@ class FugueTree:
         return not self._is_deleted(dot, view)
 
     def _is_deleted(self, dot: Dot, view: ScopeFilter) -> bool:
-        return any(view(scope) for scope in self._tombstones.get(dot, ()))
+        return any(view(mark.scope, mark.author) for mark in self._tombstones.get(dot, ()))
 
     def visible_nodes(self, view: ScopeFilter = _main_only) -> list[FugueNode]:
         """Nodes of the view in list order."""
@@ -349,7 +378,7 @@ class FugueTree:
             return [
                 self._nodes[dot]
                 for dot in self.traversal()
-                if view(self._nodes[dot].suggestion_id) and not self._is_deleted(dot, view)
+                if view(self._nodes[dot].suggestion_id, dot) and not self._is_deleted(dot, view)
             ]
         memo: dict[Dot, bool] = {}
         return [
@@ -373,6 +402,6 @@ class FugueTree:
 
     @classmethod
     def from_items(
-        cls, nodes: Iterable[FugueNode], tombstones: Iterable[tuple[Dot, frozenset[str | None]]]
+        cls, nodes: Iterable[FugueNode], tombstones: Iterable[tuple[Dot, frozenset[Tombstone]]]
     ) -> FugueTree:
         return cls({node.dot: node for node in nodes}, dict(tombstones))
