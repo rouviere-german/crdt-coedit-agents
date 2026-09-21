@@ -1,0 +1,114 @@
+# Local stack: the sync server and two headless agent replicas that propose and then wait.
+#
+# Neither agent can publish on its own. Each opens an approval request in the shared store on the
+# `state` volume and polls until a human decides, which is what the `cli` profile is for:
+#
+#   export APP_SYNC_JWT_SECRET=$(openssl rand -hex 32)
+#   docker compose up --build
+#   docker compose run --rm cli review list --approvals /data/approvals.json
+#   docker compose run --rm cli review decide <request-id> --approve --approvals /data/approvals.json
+#   docker compose run --rm cli doc show release-notes --db /data/oplog.sqlite3
+#
+# Accepting a published suggestion into the main view is a second, separate step, and only the
+# owner role may do it:
+#
+#   docker compose run --rm cli accept release-notes <request-id> --key /data/owner.key
+#
+# Only locally built images; nothing is pulled at runtime besides the pinned bases.
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 1.0
+
+services:
+  server:
+    build:
+      context: .
+    image: crdt-coedit-agents:local
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      # Required: signs the per-document role tokens. Generate with `openssl rand -hex 32`.
+      APP_SYNC_JWT_SECRET: ${APP_SYNC_JWT_SECRET:?set APP_SYNC_JWT_SECRET before starting}
+      # Comma-separated SHA-256 digests; generate with `... generate-api-key`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+    volumes:
+      - state:/data
+    restart: unless-stopped
+    <<: *hardening
+
+  drafting-agent:
+    image: crdt-coedit-agents:local
+    depends_on:
+      server:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        python -m crdt_coedit_agents keygen --key /data/drafting.key --if-missing &&
+        python -m crdt_coedit_agents agent release-notes
+        --instruction "Add a short upgrade note at the end."
+        --note "Upgrading is a drop-in replacement."
+        --url http://server:8000
+        --key /data/drafting.key
+        --approvals /data/approvals.json
+        --audit /data/agents-audit.jsonl
+        --budget /data/drafting-budget.json
+        --wait-seconds 300
+    environment:
+      APP_SYNC_JWT_SECRET: ${APP_SYNC_JWT_SECRET:?set APP_SYNC_JWT_SECRET before starting}
+      # Leave unset to use the scripted offline planner; set it to use the live model.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - state:/data
+    restart: "no"
+    <<: *hardening
+
+  review-agent:
+    image: crdt-coedit-agents:local
+    depends_on:
+      server:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        python -m crdt_coedit_agents keygen --key /data/review.key --if-missing &&
+        python -m crdt_coedit_agents agent release-notes
+        --instruction "Flag the document for review."
+        --note "Needs a second pair of eyes before release."
+        --url http://server:8000
+        --key /data/review.key
+        --approvals /data/approvals.json
+        --audit /data/agents-audit.jsonl
+        --budget /data/review-budget.json
+        --wait-seconds 300
+    environment:
+      APP_SYNC_JWT_SECRET: ${APP_SYNC_JWT_SECRET:?set APP_SYNC_JWT_SECRET before starting}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - state:/data
+    restart: "no"
+    <<: *hardening
+
+  # The human side. Started on demand: `docker compose run --rm cli <command>`.
+  cli:
+    image: crdt-coedit-agents:local
+    profiles: ["tools"]
+    environment:
+      APP_SYNC_JWT_SECRET: ${APP_SYNC_JWT_SECRET:-}
+    volumes:
+      - state:/data
+    <<: *hardening
+
+volumes:
+  state:
