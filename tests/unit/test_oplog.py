@@ -164,3 +164,23 @@ def test_the_log_survives_being_closed_and_reopened(tmp_path: Path) -> None:
     with OpLog(path) as reopened:
         assert reopened.head(DOC) == head
         assert reopened.verify(DOC, expect_head=head[1]).ok
+
+
+def test_verification_reports_a_row_that_is_not_an_operation_at_all(tmp_path: Path) -> None:
+    """Tamper-evidence has to be *reported*, not raised: `doc verify` prints JSON and exits 1."""
+    _, ops = sample_ops()
+    path = tmp_path / "oplog.sqlite3"
+    with OpLog(path) as log:
+        log.append_many(ops)
+
+    connection = sqlite3.connect(path)
+    connection.execute("UPDATE ops SET op_json = ? WHERE chain_seq = 0", ('{"nope": 1}',))
+    connection.commit()
+    connection.close()
+
+    with OpLog(path) as reopened:
+        result = reopened.verify(DOC)
+    assert result.ok is False
+    assert result.error == "malformed entry"
+    assert result.chain_seq == 0
+    assert result.entries == 0

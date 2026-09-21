@@ -24,6 +24,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from pydantic import ValidationError
+
 from crdt_coedit_agents.core.canonical import canonical_json, sha256_hex
 from crdt_coedit_agents.crdt.ids import Dot, VersionVector
 from crdt_coedit_agents.ops.model import SignedOp
@@ -144,14 +146,18 @@ class OpLog:
             ).fetchall()
         return [str(row["doc_id"]) for row in rows]
 
-    def entries(self, doc_id: str) -> Iterator[LogEntry]:
+    def _rows(self, doc_id: str) -> list[sqlite3.Row]:
         with self._lock:
-            rows = self._connection.execute(
+            return self._connection.execute(
                 "SELECT chain_seq, op_json, prev_hash, entry_hash FROM ops "
                 "WHERE doc_id = ? ORDER BY chain_seq",
                 (doc_id,),
             ).fetchall()
-        for row in rows:
+
+    def entries(self, doc_id: str) -> Iterator[LogEntry]:
+        """Every row of one document's chain, parsed. Raises on a row that is not a valid
+        operation; :meth:`verify` is the caller that reports such a row instead."""
+        for row in self._rows(doc_id):
             yield LogEntry(
                 chain_seq=int(row["chain_seq"]),
                 signed=SignedOp.model_validate_json(str(row["op_json"])),
@@ -255,31 +261,42 @@ class OpLog:
     # ------------------------------------------------------------ verification
 
     def verify(self, doc_id: str, *, expect_head: str | None = None) -> ChainVerification:
-        """Recompute the chain and re-check every signature. Reports the first failure."""
+        """Recompute the chain and re-check every signature. Reports the first failure.
+
+        Every failure is *reported*, never raised: a row whose JSON is not a valid operation at all
+        is the most likely shape of tampering, and a verifier that died on it would turn the
+        machine-readable ``doc verify`` output into a traceback.
+        """
         prev = GENESIS_HASH
         count = 0
-        for entry in self.entries(doc_id):
-            if entry.chain_seq != count:
-                return ChainVerification(
-                    False, count, prev, "sequence gap or reordering", entry.chain_seq
-                )
-            if entry.prev_hash != prev:
-                return ChainVerification(False, count, prev, "broken hash chain", entry.chain_seq)
-            op_json = _canonical_op(entry.signed)
-            if entry_hash(entry.chain_seq, entry.prev_hash, op_json) != entry.entry_hash:
-                return ChainVerification(
-                    False, count, prev, "entry content modified", entry.chain_seq
-                )
-            try:
-                verify_op(entry.signed)
-            except InvalidSignatureError:
-                return ChainVerification(
-                    False, count, prev, "invalid operation signature", entry.chain_seq
-                )
-            prev = entry.entry_hash
+        for row in self._rows(doc_id):
+            failure = _row_failure(row, count, prev)
+            if failure is not None:
+                return ChainVerification(False, count, prev, failure, int(row["chain_seq"]))
+            prev = str(row["entry_hash"])
             count += 1
         if expect_head is not None and expect_head != prev:
             return ChainVerification(
                 False, count, prev, "head mismatch (truncated or rolled back)", None
             )
         return ChainVerification(True, count, prev)
+
+
+def _row_failure(row: sqlite3.Row, expected_seq: int, prev: str) -> str | None:
+    """Why this row breaks the chain, or ``None`` when it does not."""
+    chain_seq = int(row["chain_seq"])
+    if chain_seq != expected_seq:
+        return "sequence gap or reordering"
+    if str(row["prev_hash"]) != prev:
+        return "broken hash chain"
+    try:
+        signed = SignedOp.model_validate_json(str(row["op_json"]))
+    except ValidationError:
+        return "malformed entry"
+    if entry_hash(chain_seq, prev, _canonical_op(signed)) != str(row["entry_hash"]):
+        return "entry content modified"
+    try:
+        verify_op(signed)
+    except InvalidSignatureError:
+        return "invalid operation signature"
+    return None

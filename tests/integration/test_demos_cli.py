@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import runpy
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -152,6 +153,21 @@ def test_doc_show_and_verify_read_the_local_log(tmp_path: Path) -> None:
 
     mismatched = invoke("doc", "verify", DOC_ID, "--db", str(db), "--expect-head", "0" * 64)
     assert mismatched.exit_code == 1
+
+
+def test_doc_verify_reports_a_tampered_row_as_json_instead_of_crashing(tmp_path: Path) -> None:
+    db, _ = seed_document(tmp_path)
+    connection = sqlite3.connect(db)
+    connection.execute("UPDATE ops SET op_json = ? WHERE chain_seq = 0", ('{"nope": 1}',))
+    connection.commit()
+    connection.close()
+
+    result = invoke("doc", "verify", DOC_ID, "--db", str(db))
+
+    assert result.exit_code == 1
+    body = payload(result)
+    assert body["ok"] is False
+    assert body["error"] == "malformed entry"
 
 
 def test_doc_snapshot_writes_a_verified_file(tmp_path: Path) -> None:
