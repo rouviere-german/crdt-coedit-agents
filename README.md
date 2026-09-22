@@ -158,8 +158,13 @@ With no `ANTHROPIC_API_KEY`, the agent uses a scripted offline planner and says 
 
 Containers: `docker compose up --build` runs the server and two headless agents that propose and
 then wait for a human, with the review step run through `docker compose run --rm cli`. Container
-build, smoke test, trivy scan and SBOM generation are verified in CI
-(`.github/workflows/ci.yml`, job `docker`); they were not run locally as part of building this.
+build, smoke test, trivy scan and SBOM generation are configured in CI
+(`.github/workflows/ci.yml`, job `docker`). The build, the non-root check and the HEALTHCHECK were
+also run locally (Docker 29.6.1): `docker run --rm --entrypoint id <image>` prints
+`uid=10001(app) gid=10001(app)`, a container started with a read-only root filesystem,
+`--cap-drop ALL` and `no-new-privileges` reached `healthy` with `/healthz` returning 200 and
+wrote its SQLite log to `/data`, and `docker image ls` reports 289MB on disk (65.6MB content
+size). The full three-service compose stack, trivy and the SBOM were not run locally.
 
 ## Results
 
