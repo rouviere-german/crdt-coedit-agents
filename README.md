@@ -229,7 +229,8 @@ limits are in [docs/CRDT_SEMANTICS.md](docs/CRDT_SEMANTICS.md).
   single-use and expire. Even once published, operations stay invisible until an owner writes the
   signed accept flag, and that flag is re-checked against the digest before it is written.
 - **Budgets.** Persisted step, token and USD limits per agent, charged before and after each model
-  call, surviving restarts.
+  call, surviving restarts, plus a cap on how many operations one suggestion may sign (2 000 by
+  default, `APP_AGENT_MAX_OPS_PER_SUGGESTION`), checked before the first operation is created.
 - **Bounded everything.** Frame size, operations per push, document size, catch-up size, subscriber
   count, per-connection message rate, outbound queue depth, text and field value sizes, field
   nesting depth. A consumer that stops reading is disconnected rather than buffered.
@@ -246,8 +247,10 @@ limits are in [docs/CRDT_SEMANTICS.md](docs/CRDT_SEMANTICS.md).
 
 ## Non-goals
 
-- **Rich text.** Elements are single characters with no formatting marks, and there is no
-  run-length encoding: one keystroke is one signed operation on the wire.
+- **Rich text.** Elements carry plain text with no formatting marks, and there is no run-length
+  encoding: a replica writes one element per character, so one keystroke is one signed operation
+  on the wire. The wire accepts up to 8 UTF-8 bytes per element, and anchors are mapped per
+  element, so a peer that sends more is still addressed correctly.
 - **Arbitrary JSON nesting.** The document has a fixed shape — one text sequence, one flat field
   map, one tag set. Field values may be nested JSON but are opaque to the CRDT. There is no counter
   type and no move operation.
@@ -263,7 +266,9 @@ limits are in [docs/CRDT_SEMANTICS.md](docs/CRDT_SEMANTICS.md).
   (`doc verify --expect-head`). The approval store and budget ledger are plain files and are not
   tamper-evident at all.
 - **Distributed limits.** Rate limits, subscriber counts and budgets are per process. A
-  multi-replica deployment needs a shared store.
+  multi-replica deployment needs a shared store. The per-suggestion operation cap is enforced by
+  the agent process itself; the server bounds a misbehaving agent only through its per-push,
+  document-size and message-rate limits, not per suggestion.
 - **Injection-proof models.** The envelope helps a model separate data from instructions; the
   guarantees come from the schema, the registry and the role policy. A human can still approve a
   malicious suggestion, which is why the review record shows the exact text.

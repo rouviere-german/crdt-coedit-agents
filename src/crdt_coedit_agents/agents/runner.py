@@ -106,6 +106,7 @@ def build_agent(
         approvals=ApprovalStore(config.approvals),
         audit=AuditLog(config.audit),
         principal=f"agent:{identity.replica_id[:12]}",
+        max_ops_per_suggestion=settings.agent_max_ops_per_suggestion,
     )
     return agent, provider_name
 

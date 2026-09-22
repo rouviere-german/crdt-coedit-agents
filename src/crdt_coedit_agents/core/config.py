@@ -91,6 +91,8 @@ class Settings(BaseSettings):
 
     # --- agent replicas ---
     agent_max_plan_steps: int = Field(default=12, ge=1, le=100)
+    # Operations one suggestion may sign; see agents.replica.MAX_OPS_PER_SUGGESTION.
+    agent_max_ops_per_suggestion: int = Field(default=2_000, ge=1, le=128_000)
 
     @field_validator("api_key_sha256", mode="before")
     @classmethod

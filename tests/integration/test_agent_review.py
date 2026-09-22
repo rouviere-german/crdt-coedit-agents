@@ -23,7 +23,7 @@ from crdt_coedit_agents.agents.planner import (
     SetFieldStep,
     SuggestionPlanner,
 )
-from crdt_coedit_agents.agents.replica import AgentReplica
+from crdt_coedit_agents.agents.replica import MAX_OPS_PER_SUGGESTION, AgentReplica
 from crdt_coedit_agents.agents.scripted import GullibleInjectionPolicy, ScriptedPlanPolicy
 from crdt_coedit_agents.ops.log import OpLog
 from crdt_coedit_agents.ops.model import SignedOp
@@ -70,6 +70,7 @@ def build_agent(
     *,
     policy: Policy | None = None,
     steps: int = 4,
+    max_ops_per_suggestion: int = MAX_OPS_PER_SUGGESTION,
 ) -> tuple[AgentReplica, ApprovalStore, AuditLog]:
     store = ApprovalStore(tmp_path / "approvals.json")
     audit = AuditLog(tmp_path / "audit.jsonl")
@@ -83,7 +84,14 @@ def build_agent(
     )
     replica = make_replica(2, DOC, start_ms=1_700_000_010_000)
     replica.receive(base_ops)
-    agent = AgentReplica(replica, planner, approvals=store, audit=audit, principal="agent:one")
+    agent = AgentReplica(
+        replica,
+        planner,
+        approvals=store,
+        audit=audit,
+        principal="agent:one",
+        max_ops_per_suggestion=max_ops_per_suggestion,
+    )
     return agent, store, audit
 
 
@@ -318,6 +326,59 @@ def test_a_plan_addressing_an_element_deleted_concurrently_is_rejected(tmp_path:
     agent.replica.receive(list(owner.ops()))
     with pytest.raises(PlanRejectedError, match="not in the document"):
         agent.propose("Drop a word.")
+
+
+def test_a_plan_that_would_sign_too_many_operations_is_refused_before_any_exists(
+    tmp_path: Path,
+) -> None:
+    """One budgeted model call may not turn into an unbounded number of signed operations.
+
+    The plan schema allows 64 steps of up to 2 000 characters each; three 1 500-character inserts
+    are well inside it but add up to 4 500 operations, over the default per-suggestion cap.
+    """
+
+    def padding_plan(anchors: Sequence[str], instruction: str) -> EditPlan:
+        del instruction
+        return EditPlan(
+            summary="pad the document",
+            steps=tuple(InsertAfterStep(anchor_id=anchors[-1], text="x" * 1_500) for _ in range(3)),
+        )
+
+    _, base_ops = base_document()
+    agent, store, audit = build_agent(tmp_path, base_ops, policy=ScriptedPlanPolicy(padding_plan))
+    assert MAX_OPS_PER_SUGGESTION < 4_500
+
+    with pytest.raises(PlanRejectedError, match="4500 operations"):
+        agent.propose("Pad it.")
+
+    assert agent.replica.state.known_suggestions() == frozenset()
+    assert agent.replica.view().text == BASE
+    assert pending_reviews(store) == []
+    events = [json.loads(line) for line in audit.path.read_text("utf-8").splitlines()]
+    assert events[-1]["action"] == "plan.rejected"
+    assert events[-1]["data"]["planned_ops"] == 4_500
+
+
+@pytest.mark.parametrize(("cap", "accepted"), [(38, True), (37, False)])
+def test_the_operation_cap_counts_every_operation_a_plan_would_sign(
+    tmp_path: Path, cap: int, accepted: bool
+) -> None:
+    """``plan_builder`` inserts 36 characters, sets a field and adds a tag: 38 operations."""
+    _, base_ops = base_document()
+    agent, store, _ = build_agent(tmp_path, base_ops, max_ops_per_suggestion=cap)
+    if accepted:
+        assert len(agent.propose("Add a note.").ops) == 38
+        assert len(pending_reviews(store)) == 1
+    else:
+        with pytest.raises(PlanRejectedError, match="more than the 37 allowed"):
+            agent.propose("Add a note.")
+        assert pending_reviews(store) == []
+
+
+def test_the_operation_cap_cannot_be_switched_off(tmp_path: Path) -> None:
+    _, base_ops = base_document()
+    with pytest.raises(ValueError, match="at least 1"):
+        build_agent(tmp_path, base_ops, max_ops_per_suggestion=0)
 
 
 def test_an_unknown_suggestion_cannot_be_published(tmp_path: Path) -> None:

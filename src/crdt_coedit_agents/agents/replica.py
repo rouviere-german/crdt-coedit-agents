@@ -5,7 +5,8 @@ The flow, and why it is in this order:
 1. read the **main** view — an agent never sees another agent's undecided suggestions;
 2. ask the model for a typed plan (one budgeted call);
 3. validate the whole plan against the least-privilege registry *before* creating any operation,
-   so a plan is applied completely or not at all;
+   so a plan is applied completely or not at all, and refuse it if it would sign more than
+   ``max_ops_per_suggestion`` operations;
 4. apply it locally under a fresh, unguessable suggestion id. The operations are real and signed,
    but they stay in the agent's outbox;
 5. open an approval request bound to the suggestion's **digest** — a hash of exactly what this
@@ -49,10 +50,32 @@ from crdt_coedit_agents.crdt.fugue import UnknownAnchorError
 from crdt_coedit_agents.ops.model import SignedOp
 from crdt_coedit_agents.replica import Replica, new_suggestion_id
 
-__all__ = ["AgentReplica", "PublishArgs", "SuggestionResult"]
+__all__ = [
+    "MAX_OPS_PER_SUGGESTION",
+    "AgentReplica",
+    "PublishArgs",
+    "SuggestionResult",
+    "planned_operations",
+]
 
 
 PREVIEW_CHARS = 1_000
+#: Default cap on the operations one suggestion may sign. The plan schema alone would allow 64
+#: steps of up to 2 000 characters, i.e. about 128 000 operations from a single budgeted model
+#: call; the budget ledger meters model steps, tokens and dollars, not operations, so the count is
+#: bounded here, before the first operation is created. The default equals one maximal insert.
+MAX_OPS_PER_SUGGESTION = 2_000
+
+
+def planned_operations(args: object) -> int:
+    """How many operations one validated tool call signs (an upper bound for ``remove_item``)."""
+    match args:
+        case InsertAfterArgs():
+            return len(args.text)  # Replica.insert_text writes one element per character
+        case RemoveItemArgs():
+            return args.count
+        case _:
+            return 1
 
 
 class PublishArgs(BaseModel):
@@ -121,11 +144,15 @@ class AgentReplica:
         approvals: ApprovalStore,
         audit: AuditLog,
         principal: str | None = None,
+        max_ops_per_suggestion: int = MAX_OPS_PER_SUGGESTION,
     ) -> None:
+        if max_ops_per_suggestion < 1:
+            raise ValueError("max_ops_per_suggestion must be at least 1")
         self._replica = replica
         self._planner = planner
         self._approvals = approvals
         self._audit = audit
+        self._max_ops = max_ops_per_suggestion
         self._principal = principal or f"agent:{replica.replica_id[:12]}"
         self._registry = _publish_registry()
         self._gate = ApprovalGate(approvals, principal=self._principal)
@@ -164,6 +191,22 @@ class AgentReplica:
                 "tools": [call.tool.name for call in calls],
             },
         )
+        planned = sum(planned_operations(call.args) for call in calls)
+        if planned > self._max_ops:
+            self._audit.append(
+                self._principal,
+                "plan.rejected",
+                {
+                    "doc_id": self._replica.doc_id,
+                    "reason": "too_many_operations",
+                    "planned_ops": planned,
+                    "limit": self._max_ops,
+                },
+            )
+            raise PlanRejectedError(
+                f"plan would sign {planned} operations, more than the {self._max_ops} allowed "
+                "for one suggestion"
+            )
 
         suggestion_id = new_suggestion_id()
         result = SuggestionResult(suggestion_id=suggestion_id, plan=plan)
