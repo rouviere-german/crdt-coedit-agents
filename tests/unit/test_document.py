@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 from crdt_coedit_agents.crdt.document import (
@@ -272,3 +275,112 @@ def test_an_element_without_a_recorded_author_cannot_be_sealed() -> None:
     )
     with pytest.raises(ValueError, match="no recorded author"):
         state.suggestion_seal(SUGGESTION)
+
+
+# ------------------------------------------------------ limits on the snapshot path
+
+
+def _every_kind_of_element() -> dict[str, Any]:
+    """A serialized state holding one of everything, so every limit has something to bite on."""
+    replica = make_replica(1)
+    replica.insert_text("hello")
+    replica.delete_run(replica.view().anchors[0])
+    replica.set_field("title", {"nested": [1, 2]})
+    replica.add_tag("draft")
+    replica.remove_tag("draft")
+    replica.insert_text("!", after=replica.view().anchors[-1], suggestion_id=SUGGESTION)
+    replica.decide(SUGGESTION, accept=True)
+    return replica.state.to_json()
+
+
+def _nested(depth: int) -> Any:
+    value: Any = 1
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _set(section: str, key: str, value: Any, index: int = 0) -> Callable[[dict[str, Any]], None]:
+    def mutate(payload: dict[str, Any]) -> None:
+        payload[section][index][key] = value
+
+    return mutate
+
+
+def _set_mark_scope(payload: dict[str, Any]) -> None:
+    payload["text_tombstones"][0]["marks"][0]["scope"] = "not-a-suggestion"
+
+
+def _set_doc_id(payload: dict[str, Any]) -> None:
+    payload["doc_id"] = "Not A Document Id"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        pytest.param(_set("text_nodes", "value", "x" * 100_000), "UTF-8 bytes", id="huge-node"),
+        pytest.param(_set("text_nodes", "value", "a\x00"), "NUL", id="nul-in-text"),
+        pytest.param(_set("text_nodes", "value", ""), "empty", id="empty-node"),
+        pytest.param(_set("text_nodes", "value", 7), "string", id="non-string-node"),
+        pytest.param(
+            _set("text_nodes", "suggestion_id", "../../etc/passwd"), "suggestion id", id="node-sid"
+        ),
+        pytest.param(_set_mark_scope, "suggestion id", id="tombstone-scope"),
+        pytest.param(_set("tag_adds", "element", "<script>\x07zzz"), "tag", id="tag-control-byte"),
+        pytest.param(_set("tag_adds", "element", "a" * 65), "tag", id="tag-too-long"),
+        pytest.param(_set("tag_adds", "suggestion_id", "sg-x"), "suggestion id", id="tag-sid"),
+        pytest.param(
+            _set("tag_removes", "suggestion_id", "sg-x"), "suggestion id", id="tag-removal-sid"
+        ),
+        pytest.param(_set("fields", "key", "Title!"), "field key", id="field-key"),
+        pytest.param(_set("fields", "value", _nested(40)), "levels deep", id="field-depth"),
+        pytest.param(_set("fields", "value", "x" * 5_000), "bytes", id="field-size"),
+        pytest.param(_set("fields", "suggestion_id", "sg-x"), "suggestion id", id="field-sid"),
+        pytest.param(
+            _set("decisions", "suggestion_id", "../../etc/passwd"),
+            "suggestion id",
+            id="decision-id",
+        ),
+        pytest.param(_set("decisions", "value", True), "decision", id="decision-bare-bool"),
+        pytest.param(
+            _set("decisions", "value", {"accept": "yes", "seal": []}),
+            "decision",
+            id="decision-accept-type",
+        ),
+        pytest.param(
+            _set("decisions", "value", {"accept": True, "seal": [], "extra": 1}),
+            "decision",
+            id="decision-extra-key",
+        ),
+        pytest.param(
+            _set("decisions", "value", {"accept": True, "seal": ["not-a-run"]}),
+            "sealed runs",
+            id="decision-bad-run",
+        ),
+        pytest.param(
+            _set(
+                "decisions",
+                "value",
+                {"accept": True, "seal": [f"{'a' * 32}.{n}-{n}" for n in range(1, 400, 2)]},
+            ),
+            "at most",
+            id="decision-too-many-runs",
+        ),
+        pytest.param(_set_doc_id, "document id", id="doc-id"),
+    ],
+)
+def test_a_state_that_breaks_the_operation_limits_is_refused(
+    mutate: Callable[[dict[str, Any]], None], message: str
+) -> None:
+    """``from_json`` enforces the same bounds as the operation model, not a looser set.
+
+    A snapshot is the one way into a replica's state that does not go through a
+    ``TextInsert``/``TagAdd``/``FieldSet``, so without these checks a hand-written snapshot could
+    carry a 100 000-character element, a tag with a control byte, a field nested 40 deep, or an
+    accepted decision for an id that is not a suggestion id at all.
+    """
+    payload = _every_kind_of_element()
+    DocumentState.from_json(payload)  # the untouched state is fine
+    mutate(payload)
+    with pytest.raises(ValueError, match=message):
+        DocumentState.from_json(payload)

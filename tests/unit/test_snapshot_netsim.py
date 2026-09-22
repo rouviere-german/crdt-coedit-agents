@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from crdt_coedit_agents.core.canonical import canonical_json, sha256_hex
 from crdt_coedit_agents.netsim import NetworkProfile, NetworkSimulator
 from crdt_coedit_agents.replica import Replica
 from crdt_coedit_agents.snapshot import (
@@ -92,6 +93,26 @@ def test_a_snapshot_whose_body_is_malformed_is_refused(tmp_path: Path) -> None:
     )
     with pytest.raises(SnapshotError, match="malformed"):
         broken.restore()
+
+
+def test_a_self_consistent_snapshot_that_breaks_the_operation_limits_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The state hash only proves the file is internally consistent, not that it is well formed.
+
+    Anyone who can write the file can recompute the hash, so the limits the operation model
+    enforces on the wire have to be enforced again when the state is rebuilt.
+    """
+    replica = populated()
+    path = tmp_path / "snap.json"
+    write_snapshot(path, replica.state, replica.version_vector)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["state"]["text_nodes"][0]["value"] = "x" * 100_000
+    payload["state_hash"] = sha256_hex(canonical_json(payload["state"]))
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SnapshotError, match="malformed"):
+        load_snapshot(path)
 
 
 def test_the_summary_reads_the_header_without_rebuilding_the_state(tmp_path: Path) -> None:

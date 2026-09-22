@@ -18,8 +18,11 @@ itself may never carry one, because a suggestion that could accept itself would 
 the operations the decider could see. Operations added to the suggestion afterwards are outside the
 seal and stay invisible for ever, so an approval cannot be widened after the fact.
 
-Limits (payload size, ops per delta, field-value depth) are enforced here, in the model, so they
-apply on every path: the server, a peer receiving a delta and a replica loading a snapshot.
+Limits (payload size, ops per delta, field-value depth) are enforced here, in the model, for
+everything that arrives as an operation: the server and a peer receiving a delta. The per-element
+checks live in :mod:`crdt_coedit_agents.crdt.limits`, which
+:meth:`~crdt_coedit_agents.crdt.document.DocumentState.from_json` calls as well, so a replica
+loading a snapshot is held to the same bounds.
 """
 
 from __future__ import annotations
@@ -30,9 +33,25 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from crdt_coedit_agents.crdt.hlc import Timestamp
-from crdt_coedit_agents.crdt.ids import DOT_RANGE_PATTERN, REPLICA_ID_PATTERN, Dot, parse_dot
+from crdt_coedit_agents.crdt.ids import REPLICA_ID_PATTERN, Dot, parse_dot
+from crdt_coedit_agents.crdt.limits import (
+    DOC_ID_PATTERN,
+    FIELD_KEY_PATTERN,
+    MAX_FIELD_DEPTH,
+    MAX_FIELD_VALUE_BYTES,
+    MAX_SEAL_RUNS,
+    MAX_TAG_LENGTH,
+    MAX_TEXT_VALUE_BYTES,
+    SUGGESTION_ID_PATTERN,
+    TAG_PATTERN,
+    check_field_value,
+    check_seal_runs,
+    check_text_value,
+)
 
 __all__ = [
+    "DOC_ID_PATTERN",
+    "FIELD_KEY_PATTERN",
     "MAX_DELTA_BYTES",
     "MAX_FIELD_DEPTH",
     "MAX_FIELD_VALUE_BYTES",
@@ -40,6 +59,8 @@ __all__ = [
     "MAX_SEAL_RUNS",
     "MAX_TAG_LENGTH",
     "MAX_TEXT_VALUE_BYTES",
+    "SUGGESTION_ID_PATTERN",
+    "TAG_PATTERN",
     "Delta",
     "FieldSet",
     "OpKind",
@@ -54,38 +75,13 @@ __all__ = [
     "signing_payload",
 ]
 
-MAX_TEXT_VALUE_BYTES = 8
-MAX_FIELD_VALUE_BYTES = 4_096
-MAX_FIELD_DEPTH = 8
-MAX_TAG_LENGTH = 64
 MAX_OPS_PER_DELTA = 512
 MAX_DELTA_BYTES = 1_048_576
-#: How many contiguous ``(replica, seq)`` runs one decision may seal. A suggestion written the
-#: ordinary way needs one run per contributing replica; the bound is generous so that interleaved
-#: authorship still fits, and refusing beyond it keeps a decision small enough to sign and relay.
-MAX_SEAL_RUNS = 128
-
-SUGGESTION_ID_PATTERN = r"^sg-[0-9a-f]{16}$"
-FIELD_KEY_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
-TAG_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9 _/-]{0,63}$"
-DOC_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,63}$"
 _ANCHOR = re.compile(r"^[0-9a-f]{32}\.[1-9][0-9]{0,17}$")
-_DOT_RANGE = re.compile(DOT_RANGE_PATTERN)
 
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-def _check_depth(value: JsonValue, depth: int = 0) -> None:
-    if depth > MAX_FIELD_DEPTH:
-        raise ValueError(f"field values may nest at most {MAX_FIELD_DEPTH} levels deep")
-    if isinstance(value, dict):
-        for item in value.values():
-            _check_depth(item, depth + 1)
-    elif isinstance(value, list):
-        for item in value:
-            _check_depth(item, depth + 1)
 
 
 class TextInsert(_Frozen):
@@ -112,11 +108,7 @@ class TextInsert(_Frozen):
     @field_validator("value")
     @classmethod
     def _bounded_value(cls, value: str) -> str:
-        if len(value.encode("utf-8")) > MAX_TEXT_VALUE_BYTES:
-            raise ValueError(f"text values are limited to {MAX_TEXT_VALUE_BYTES} UTF-8 bytes")
-        if "\x00" in value:
-            raise ValueError("text values may not contain NUL")
-        return value
+        return check_text_value(value)
 
     @property
     def parent_dot(self) -> Dot | None:
@@ -144,12 +136,7 @@ class FieldSet(_Frozen):
     @field_validator("value")
     @classmethod
     def _bounded_value(cls, value: JsonValue) -> JsonValue:
-        _check_depth(value)
-        from crdt_coedit_agents.core.canonical import canonical_json  # noqa: PLC0415
-
-        if len(canonical_json(value).encode("utf-8")) > MAX_FIELD_VALUE_BYTES:
-            raise ValueError(f"field values are limited to {MAX_FIELD_VALUE_BYTES} bytes")
-        return value
+        return check_field_value(value)
 
 
 class TagAdd(_Frozen):
@@ -197,15 +184,7 @@ class SuggestionDecide(_Frozen):
     @field_validator("sealed")
     @classmethod
     def _valid_runs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) > MAX_SEAL_RUNS:
-            raise ValueError(f"a decision may seal at most {MAX_SEAL_RUNS} operation runs")
-        for item in value:
-            if not _DOT_RANGE.fullmatch(item):
-                raise ValueError("sealed runs must look like <replica_id>.<low>-<high>")
-            low, _, high = item.partition("-")
-            if int(low.rsplit(".", 1)[1]) > int(high):
-                raise ValueError("a sealed run may not run backwards")
-        return value
+        return check_seal_runs(value)
 
 
 OpPayload = Annotated[

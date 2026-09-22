@@ -46,6 +46,15 @@ from crdt_coedit_agents.core.canonical import canonical_json, sha256_hex
 from crdt_coedit_agents.crdt.fugue import FugueNode, FugueTree, Side, Tombstone
 from crdt_coedit_agents.crdt.hlc import Timestamp
 from crdt_coedit_agents.crdt.ids import Dot, compress_dots, parse_dot, parse_dot_ranges
+from crdt_coedit_agents.crdt.limits import (
+    check_doc_id,
+    check_field_key,
+    check_field_value,
+    check_seal_runs,
+    check_suggestion_id,
+    check_tag,
+    check_text_value,
+)
 from crdt_coedit_agents.crdt.lww import LWWEntry, LWWMap, VisibilityFilter
 from crdt_coedit_agents.crdt.orset import ORSet, Tag, TagRemoval
 
@@ -347,13 +356,20 @@ class DocumentState:
 
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> DocumentState:
-        """Rebuild a state from :meth:`to_json`. Raises ``ValueError`` on anything malformed."""
+        """Rebuild a state from :meth:`to_json`. Raises ``ValueError`` on anything malformed.
+
+        This is the one way into a state that does not go through an operation, so every element
+        is held to the same limits the operation model enforces on the wire
+        (:mod:`crdt_coedit_agents.crdt.limits`): text values, tags, field keys and values,
+        suggestion ids, decisions and their seals. A snapshot's state hash cannot stand in for
+        these checks, because whoever wrote the file could also have written a matching hash.
+        """
         if payload.get("v") != STATE_VERSION:
             raise ValueError("unsupported document state version")
         doc_id = payload["doc_id"]
         if not isinstance(doc_id, str):
             raise ValueError("doc_id must be a string")  # noqa: TRY004 - a value error, not a type
-        state = cls(doc_id=doc_id)
+        state = cls(doc_id=check_doc_id(doc_id))
         for item in payload["text_nodes"]:
             parent = item["parent"]
             state.text.add_node(
@@ -361,47 +377,50 @@ class DocumentState:
                     dot=parse_dot(item["dot"]),
                     parent=parse_dot(parent) if parent is not None else None,
                     side=Side(item["side"]),
-                    value=item["value"],
-                    suggestion_id=item["suggestion_id"],
+                    value=check_text_value(item["value"]),
+                    suggestion_id=_optional_suggestion(item["suggestion_id"]),
                 )
             )
         for item in payload["text_tombstones"]:
             for mark in item["marks"]:
                 state.text.tombstone(
                     parse_dot(item["dot"]),
-                    mark["scope"],
+                    _optional_suggestion(mark["scope"]),
                     _optional_dot(mark["author"]),
                 )
         for item in payload["fields"]:
             state.fields.set(
-                item["key"],
+                check_field_key(item["key"]),
                 LWWEntry(
-                    value=item["value"],
+                    value=check_field_value(item["value"]),
                     timestamp=Timestamp.decode(item["ts"]),
                     author=_optional_dot(item["author"]),
                 ),
-                item["suggestion_id"],
+                _optional_suggestion(item["suggestion_id"]),
             )
         for item in payload["tag_adds"]:
             state.tags.add(
                 Tag(
-                    element=item["element"],
+                    element=check_tag(item["element"]),
                     dot=parse_dot(item["dot"]),
-                    suggestion_id=item["suggestion_id"],
+                    suggestion_id=_optional_suggestion(item["suggestion_id"]),
                 )
             )
         for item in payload["tag_removes"]:
             state.tags.remove(
                 TagRemoval(
                     dot=parse_dot(item["dot"]),
-                    suggestion_id=item["suggestion_id"],
+                    suggestion_id=_optional_suggestion(item["suggestion_id"]),
                     author=_optional_dot(item["author"]),
                 )
             )
         for item in payload["decisions"]:
             state.decisions.set(
-                item["suggestion_id"],
-                LWWEntry(value=item["value"], timestamp=Timestamp.decode(item["ts"])),
+                check_suggestion_id(item["suggestion_id"]),
+                LWWEntry(
+                    value=_checked_decision(item["value"]),
+                    timestamp=Timestamp.decode(item["ts"]),
+                ),
             )
         return state
 
@@ -481,6 +500,23 @@ class DocumentState:
         )
         tag_bytes = sum(len(tag.element.encode("utf-8")) for tag in self.tags.tags())
         return text_bytes + field_bytes + tag_bytes
+
+
+def _optional_suggestion(value: Any) -> str | None:
+    """A scope read from a snapshot: ``None`` (the main document) or a well-formed suggestion id."""
+    return None if value is None else check_suggestion_id(value)
+
+
+def _checked_decision(value: Any) -> dict[str, Any]:
+    """A decision register read from a snapshot, in exactly the shape ``apply_op`` writes."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"accept", "seal"}
+        or not isinstance(value["accept"], bool)
+        or not isinstance(value["seal"], list)
+    ):
+        raise ValueError('a decision must be {"accept": <bool>, "seal": [<run>, ...]}')
+    return decision_value(accept=value["accept"], seal=check_seal_runs(value["seal"]))
 
 
 def _optional_dot(value: Any) -> Dot | None:

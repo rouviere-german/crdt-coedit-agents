@@ -119,6 +119,7 @@ run on the machine named there; they are not estimates and they are not from CI.
 | # | Claim | Evidence |
 |---|---|---|
 | C68 | Snapshots are written atomically and verified against their recorded hash on load | `tests/unit/test_snapshot_netsim.py::test_a_snapshot_round_trips_and_carries_the_version_vector`, `tests/unit/test_snapshot_netsim.py::test_a_corrupted_snapshot_is_refused`, `tests/unit/test_snapshot_netsim.py::test_writing_a_snapshot_never_leaves_a_partial_file` |
+| C68a | A snapshot is held to the operation model's limits: a file whose hash matches but whose elements break a bound (a 100 000-character element, a tag with a control byte, a field nested 40 deep, a decision for a non-suggestion id) is refused as malformed | `tests/unit/test_snapshot_netsim.py::test_a_self_consistent_snapshot_that_breaks_the_operation_limits_is_refused`, `tests/unit/test_document.py::test_a_state_that_breaks_the_operation_limits_is_refused`, `tests/unit/test_limits.py::test_the_operation_model_uses_the_same_limits_as_the_snapshot_path` |
 | C69 | A restored snapshot is a working replica | `tests/unit/test_snapshot_netsim.py::test_a_snapshot_restores_into_a_working_replica` |
 | C70 | The offline demo converges, accepts one suggestion and rejects the other with no trace | `tests/integration/test_demos_cli.py::test_the_demo_converges_accepts_one_suggestion_and_rejects_the_other` |
 | C71 | Running the demo twice starts from a clean state | `tests/integration/test_demos_cli.py::test_running_the_demo_twice_starts_from_a_clean_state` |
