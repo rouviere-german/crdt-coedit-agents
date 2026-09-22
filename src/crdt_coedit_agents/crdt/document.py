@@ -124,7 +124,13 @@ class Scope:
 
 @dataclass(frozen=True, slots=True)
 class DocumentView:
-    """A materialized, JSON-like snapshot of the document."""
+    """A materialized, JSON-like snapshot of the document.
+
+    ``anchors[i]`` names the i-th visible element and ``anchor_offsets[i]`` is the character offset
+    in ``text`` where that element's value begins. Locally typed text is one character per element,
+    but an element may hold up to ``MAX_TEXT_VALUE_BYTES`` on the wire, so an index into ``text``
+    is not an index into ``anchors``: map between them through ``anchor_offsets``.
+    """
 
     doc_id: str
     scope: str
@@ -132,6 +138,7 @@ class DocumentView:
     fields: dict[str, JsonValue]
     tags: list[str]
     anchors: list[str]
+    anchor_offsets: list[int]
 
     def as_json(self) -> dict[str, JsonValue]:
         return {
@@ -284,13 +291,20 @@ class DocumentState:
     def view(self, scope: VisibilityFilter | None = None, *, name: str = "main") -> DocumentView:
         filter_: VisibilityFilter = scope if scope is not None else self.main_scope()
         label = getattr(filter_, "name", name)
+        nodes = self.text.visible_nodes(filter_)
+        offsets: list[int] = []
+        position = 0
+        for node in nodes:
+            offsets.append(position)
+            position += len(node.value)
         return DocumentView(
             doc_id=self.doc_id,
             scope=str(label),
-            text=self.text.materialize(filter_),
+            text="".join(node.value for node in nodes),
             fields=self.fields.materialize(filter_),
             tags=self.tags.materialize(filter_),
-            anchors=self.text.anchors(filter_),
+            anchors=[node.anchor_id for node in nodes],
+            anchor_offsets=offsets,
         )
 
     def to_json(self) -> dict[str, Any]:

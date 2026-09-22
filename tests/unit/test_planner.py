@@ -34,7 +34,9 @@ from crdt_coedit_agents.agents.scripted import (
     plan_response,
 )
 from crdt_coedit_agents.crdt.document import DocumentView
-from tests.conftest import make_replica
+from crdt_coedit_agents.crdt.hlc import Timestamp
+from crdt_coedit_agents.ops.model import TextInsert, UnsignedOp
+from tests.conftest import make_replica, seeded_identity
 
 pytestmark = pytest.mark.unit
 
@@ -73,6 +75,54 @@ def test_the_anchor_table_lists_the_start_word_starts_and_the_end() -> None:
     assert rows[-1].preview == "<end of document>"
     assert [row.preview for row in rows[1:-1]] == ["ab cd ef", "cd ef", "ef"]
     assert anchor_table(view(""), max_rows=3) == rows[:1]
+
+
+def _view_with_a_multi_character_element() -> DocumentView:
+    """``Hello`` arrives from a peer as one five-character element; `` world`` is typed locally.
+
+    ``Replica.insert_text`` writes one character per element, but the wire allows up to
+    ``MAX_TEXT_VALUE_BYTES`` per element, so a peer may legitimately send more.
+    """
+    peer = seeded_identity(2)
+    local = make_replica(1)
+    unsigned = UnsignedOp(
+        doc_id=local.doc_id,
+        replica_id=peer.replica_id,
+        seq=1,
+        ts=Timestamp(wall_ms=1_700_000_000_000, counter=0, replica_id=peer.replica_id).encode(),
+        payload=TextInsert(value="Hello"),
+    )
+    assert local.receive([peer.sign(unsigned)]).applied == 1
+    local.append_text(" world")
+    return local.view()
+
+
+def test_every_anchor_row_previews_the_text_starting_at_its_own_element() -> None:
+    doc = _view_with_a_multi_character_element()
+    assert doc.text == "Hello world"
+    assert len(doc.anchors) == 7  # one element for "Hello", six for " world"
+    rows = anchor_table(doc)
+
+    assert [row.preview for row in rows] == [
+        "<start of document>",
+        "Hello world",
+        "world",
+        "<end of document>",
+    ]
+    assert rows[1].anchor_id == doc.anchors[0]
+    assert rows[2].anchor_id == doc.anchors[2]  # the "w", not the element six characters on
+    assert rows[-1].anchor_id == doc.anchors[-1]
+
+
+def test_the_last_element_is_listed_once_even_when_it_starts_a_word() -> None:
+    rows = anchor_table(view("ab c"))
+    anchor_ids = [row.anchor_id for row in rows]
+    assert len(anchor_ids) == len(set(anchor_ids))
+    assert [row.preview for row in rows] == [
+        "<start of document>",
+        "ab c",
+        "<end of document>",
+    ]
 
 
 def test_the_anchor_table_is_bounded() -> None:

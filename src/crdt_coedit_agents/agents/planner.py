@@ -143,18 +143,24 @@ def anchor_table(view: DocumentView, *, max_rows: int = MAX_ANCHOR_ROWS) -> list
     word starts are where edits actually go, the last element is how you append, and the replica
     resolves whichever anchor the plan names. Anchors the plan invents are rejected before any
     operation is created.
+
+    The table walks *elements*, not characters: an element may hold more than one character, so
+    each row's preview is taken from that element's own offset in the text. A word that starts in
+    the middle of an element has no anchor of its own and is not listed. The last element is listed
+    once, as the end of the document, even when it also starts a word.
     """
     rows = [AnchorRow(anchor_id="START", preview="<start of document>")]
-    text, anchors = view.text, view.anchors
-    previous_is_space = True
-    for index, character in enumerate(text):
+    text = view.text
+    for anchor_id, offset in zip(view.anchors, view.anchor_offsets, strict=True):
         if len(rows) >= max_rows - 1:
             break
-        if previous_is_space and not character.isspace() and index < len(anchors):
-            rows.append(AnchorRow(anchor_id=anchors[index], preview=text[index : index + 24]))
-        previous_is_space = character.isspace()
-    if anchors:
-        rows.append(AnchorRow(anchor_id=anchors[-1], preview="<end of document>"))
+        after_space = offset == 0 or text[offset - 1].isspace()
+        if after_space and not text[offset].isspace():
+            rows.append(AnchorRow(anchor_id=anchor_id, preview=text[offset : offset + 24]))
+    if view.anchors:
+        if rows[-1].anchor_id == view.anchors[-1]:
+            rows.pop()
+        rows.append(AnchorRow(anchor_id=view.anchors[-1], preview="<end of document>"))
     return rows
 
 
