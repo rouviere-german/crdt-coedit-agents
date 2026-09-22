@@ -370,7 +370,11 @@ class DocumentState:
 
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> DocumentState:
-        """Rebuild a state from :meth:`to_json`. Raises ``ValueError`` on anything malformed.
+        """Rebuild a state from :meth:`to_json`.
+
+        Raises ``ValueError`` on anything malformed, ``TypeError`` when a value has the wrong type
+        and ``KeyError`` when a required key is missing;
+        :class:`~crdt_coedit_agents.snapshot.Snapshot` turns all three into a malformed snapshot.
 
         This is the one way into a state that does not go through an operation, so every element
         is held to the same limits the operation model enforces on the wire
@@ -538,5 +542,5 @@ def _optional_dot(value: Any) -> Dot | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError("an author must be a dot string or null")  # noqa: TRY004 - a value error
+        raise TypeError("an author must be a dot string or null")
     return parse_dot(value)

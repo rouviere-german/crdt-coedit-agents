@@ -52,7 +52,7 @@ def test_seal_runs_are_bounded_well_formed_and_forward() -> None:
         limits.check_seal_runs([*runs, f"{REPLICA}.999-999"])
     with pytest.raises(ValueError, match="backwards"):
         limits.check_seal_runs([f"{REPLICA}.5-2"])
-    with pytest.raises(ValueError, match="must be a string"):
+    with pytest.raises(TypeError, match="must be a string"):
         limits.check_seal_runs([5])
 
 
@@ -71,5 +71,5 @@ def test_identifier_checks_accept_the_pattern_and_nothing_else(
     assert check(good) == good
     with pytest.raises(ValueError, match="must match"):
         check(bad)
-    with pytest.raises(ValueError, match="must be a string"):
+    with pytest.raises(TypeError, match="must be a string"):
         check(None)

@@ -6,9 +6,10 @@ There are two such ways. Operations arrive on the wire and are parsed by the pyd
 operation. Both call the checks below, so a hand-written snapshot cannot carry anything a signed
 operation could not.
 
-The checks raise ``ValueError`` with a message that names the limit. Pydantic turns that into a
-validation error on the wire path; the snapshot path lets it propagate, and
-:class:`crdt_coedit_agents.snapshot.Snapshot` reports it as a malformed snapshot.
+The checks raise ``ValueError`` with a message that names the limit, or ``TypeError`` for a value
+that is not even a string. Pydantic turns a ``ValueError`` into a validation error on the wire path
+(where the model has already checked types); the snapshot path lets both propagate, and
+:class:`crdt_coedit_agents.snapshot.Snapshot` reports them as a malformed snapshot.
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ _DOT_RANGE = re.compile(DOT_RANGE_PATTERN)
 
 def _require_str(value: object, what: str) -> str:
     if not isinstance(value, str):
-        raise ValueError(f"{what} must be a string")  # noqa: TRY004 - a value error, not a type
+        raise TypeError(f"{what} must be a string")
     return value
 
 

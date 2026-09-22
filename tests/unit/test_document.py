@@ -321,7 +321,6 @@ def _set_doc_id(payload: dict[str, Any]) -> None:
         pytest.param(_set("text_nodes", "value", "x" * 100_000), "UTF-8 bytes", id="huge-node"),
         pytest.param(_set("text_nodes", "value", "a\x00"), "NUL", id="nul-in-text"),
         pytest.param(_set("text_nodes", "value", ""), "empty", id="empty-node"),
-        pytest.param(_set("text_nodes", "value", 7), "string", id="non-string-node"),
         pytest.param(
             _set("text_nodes", "suggestion_id", "../../etc/passwd"), "suggestion id", id="node-sid"
         ),
@@ -383,4 +382,21 @@ def test_a_state_that_breaks_the_operation_limits_is_refused(
     DocumentState.from_json(payload)  # the untouched state is fine
     mutate(payload)
     with pytest.raises(ValueError, match=message):
+        DocumentState.from_json(payload)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(_set("text_nodes", "value", 7), id="non-string-node"),
+        pytest.param(_set("tag_adds", "element", ["draft"]), id="non-string-tag"),
+        pytest.param(_set("fields", "author", 12), id="non-string-author"),
+    ],
+)
+def test_a_state_value_of_the_wrong_type_is_a_type_error(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    payload = _every_kind_of_element()
+    mutate(payload)
+    with pytest.raises(TypeError, match="must be a"):
         DocumentState.from_json(payload)
