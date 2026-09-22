@@ -37,7 +37,7 @@ flowchart TB
 
     subgraph sync["Sync server"]
         session["Session: hello / push / pull<br/>rate limit, bounded queue"] --> checks
-        checks["Verify signature → authorize role<br/>→ replay guard → size limit"] --> oplog[("Hash-chained<br/>SQLite op log")]
+        checks["Verify signature → authorize role<br/>→ clock bound → suggestion not yet decided<br/>→ size limit → replay guard"] --> oplog[("Hash-chained<br/>SQLite op log")]
         oplog --> relay["Relay + version-vector catch-up"]
     end
 
@@ -79,8 +79,9 @@ and a stolen key are both needed to write as someone else.
 
 **Agent edits are ordinary operations behind a flag.** They are signed, replicated and hidden. A
 last-writer-wins register says whether a suggestion is visible, and only the `owner` role may write
-it. Accepting commutes with concurrent typing; rejecting leaves the main view byte-identical to a
-history in which the agent never ran.
+it. The decision seals the exact set of operations the owner saw, so anything an agent adds to that
+suggestion afterwards stays invisible. Accepting commutes with concurrent typing; rejecting leaves
+the main view byte-identical to a history in which the agent never ran.
 
 Layout:
 
@@ -114,14 +115,16 @@ The demo runs the real sync service in process over in-memory channels — the s
 session state machine, the same role policy — with an owner and two agents. It writes a document,
 lets one agent propose an edit, has a human approve exactly what that agent showed, partitions the
 second agent, keeps editing on both sides, heals, and prints the convergence hash. Then the owner
-accepts one suggestion and rejects the other:
+accepts one suggestion and rejects the other. An excerpt of one run's output (suggestion ids are
+random and the clocks are real, so the hash itself changes from run to run; what does not change is
+that all four replicas report the same one):
 
 ```json
 {
   "converged": true,
   "partition_caused_divergence": true,
-  "replica_hashes": {"drafter": "bb5747dc5bd69655", "offline": "bb5747dc5bd69655",
-                     "owner": "bb5747dc5bd69655", "server": "bb5747dc5bd69655"},
+  "replica_hashes": {"drafter": "77f9010b5d1619b2", "offline": "77f9010b5d1619b2",
+                     "owner": "77f9010b5d1619b2", "server": "77f9010b5d1619b2"},
   "initial_text": "Release 2.4 ships faster sync and clearer errors.",
   "final_text": "Release 2.4 ships faster sync and clearer errors. Upgrading is a drop-in replacement. Thanks to everyone who reported issues.",
   "rejected_suggestion_left_no_trace": true,
@@ -161,17 +164,17 @@ build, smoke test, trivy scan and SBOM generation are verified in CI
 ## Results
 
 Measured with `uv run python tasks.py bench` (which runs `bench/bench_baseline.py --check` and
-`bench/bench_crdt.py --check`) on 2026-09-21: Windows 10 (10.0.19045), Intel64 Family 6 Model 158
+`bench/bench_crdt.py --check`) on 2026-09-22: Windows 10 (10.0.19045), Intel64 Family 6 Model 158
 Stepping 10, 6 logical CPUs, Python 3.12.14. Latency per operation in microseconds. CI runs the
 same commands against the looser limits in `bench/thresholds.json` and `bench/thresholds_crdt.json`;
 this run printed "all benchmarks within thresholds" for both.
 
 | benchmark | runs | p50 (us) | p95 (us) | ops/s at p50 |
 |---|---:|---:|---:|---:|
-| local_insert (resolve + sign + apply) | 2000 | 117.0 | 146.3 | 8 547 |
-| remote_apply_verified (verify + apply) | 2000 | 149.8 | 162.2 | 6 676 |
-| merge_only (apply an already-verified op) | 2000 | 6.2 | 6.7 | 161 290 |
-| materialize_20000 (cold traversal + text) | 20 | 45 112.6 | 45 901.3 | 22 |
+| local_insert (resolve + sign + apply) | 2000 | 126.1 | 211.5 | 7 930 |
+| remote_apply_verified (verify + apply) | 2000 | 156.0 | 216.8 | 6 410 |
+| merge_only (apply an already-verified op) | 2000 | 6.6 | 7.9 | 151 515 |
+| materialize_20000 (cold traversal + text) | 20 | 50 315.4 | 61 918.2 | 20 |
 
 | measurement | value |
 |---|---:|
@@ -183,11 +186,11 @@ this run printed "all benchmarks within thresholds" for both.
 
 What these numbers say:
 
-- **The signature is the cost.** Applying an already-verified operation is 6.2 µs; verifying one
-  first takes 150 µs. Not trusting the sync server costs roughly 24× per remote operation, and it
-  is still about 6 700 operations per second on one core.
+- **The signature is the cost.** Applying an already-verified operation is 6.6 µs; verifying one
+  first takes 156 µs. Not trusting the sync server costs roughly 24× per remote operation, and it
+  is still about 6 400 operations per second on one core.
 - **Inserting is cheap, materializing is not.** A local insert is constant-time in the document
-  length; turning a 20 000-element document into text takes 45 ms and is cached until the node set
+  length; turning a 20 000-element document into text takes 50 ms and is cached until the node set
   changes. That is the trade the tree makes, and it is why a replica materializes on demand rather
   than after every operation.
 - **Delta synchronization earns its keep.** A replica ten operations behind downloads 0.25% of what
@@ -195,8 +198,9 @@ What these numbers say:
 - **Convergence is exact, not approximate.** Five replicas receiving the same 400 operations in
   five different random orders end on one state hash and one text.
 
-Correctness numbers come from the test suite rather than the benchmarks: 544 passing tests (1
-skipped), 93.76% line and branch coverage against an 85% floor, and the convergence scenario the
+Correctness numbers come from the test suite rather than the benchmarks (`uv run python tasks.py
+test`, 2026-09-22): 620 passing tests (1 skipped), 96.61% line and branch coverage against an 85%
+floor, and the convergence scenario the
 specification asks for — 5 replicas, 10 000
 operations, random delivery order, duplication and a partition that heals — in
 `tests/property/test_convergence.py::test_five_replicas_converge_over_ten_thousand_operations`.
@@ -233,7 +237,8 @@ limits are in [docs/CRDT_SEMANTICS.md](docs/CRDT_SEMANTICS.md).
   default, `APP_AGENT_MAX_OPS_PER_SUGGESTION`), checked before the first operation is created.
 - **Bounded everything.** Frame size, operations per push, document size, catch-up size, subscriber
   count, per-connection message rate, outbound queue depth, text and field value sizes, field
-  nesting depth. A consumer that stops reading is disconnected rather than buffered.
+  nesting depth. The element limits are one set of checks applied both to incoming operations and
+  to a snapshot being loaded. A consumer that stops reading is disconnected rather than buffered.
 - **Tamper-evident history.** A per-document hash chain in SQLite whose `verify` recomputes every
   hash *and* re-checks every signature, so rebuilding the chain does not help. A separate
   hash-chained audit log records every review decision, with `audit-verify`.
